@@ -1,25 +1,75 @@
 # Telegram Business Multi-Account Auto-Responder Framework ⚡
 
-A high-performance, single-file Telegram Auto-Responder built with **FastAPI**, **Telegram Business Bot API**, and **HTTPX**.
+A high-performance, single-file Telegram Auto-Responder built with **FastAPI**, **Telegram Business Bot API**, **Motor (Async MongoDB)**, and **HTTPX**.
 
-Instead of complex `API_ID`, `API_HASH`, or phone session strings, this framework uses **Telegram Business** to connect a single `@BotFather` bot to **unlimited personal Telegram accounts**, managing each account's incoming private DMs completely isolated from each other.
+Manage multiple personal Telegram accounts with zero `API_ID` / `API_HASH` friction. Configure everything through an **interactive Telegram DM Setup Wizard** (`/settings`) or through the **built-in Dark Mode Web Dashboard**.
 
-Runs seamlessly on the **Render Free Tier** (0.1 vCPU, 500MB RAM) with an ultra-lightweight memory footprint of **< 50MB RAM**.
+Runs seamlessly on the **Render Free Tier** (0.1 vCPU, 500MB RAM) with an ultra-lightweight memory footprint of **< 60MB RAM**.
 
 ---
 
-## 🌟 How It Works (Telegram Business Architecture)
+## 🌟 Key Features
 
-1. You create a single bot with `@BotFather` and run this service with `BOT_TOKEN`.
-2. Any personal Telegram account links your bot in their Telegram app:
-   - Go to **Settings** → **Telegram Business** → **Chatbots**.
-   - Add your bot `@YourBot` and check **"Reply to messages"**.
-3. Once linked:
-   - When customers or friends send private DMs to that personal account, Telegram securely delivers a `business_message` update to your bot.
-   - **Step A (Triggers)**: The bot checks for keyword matches (`.lower()`) and sends instant automated replies directly on behalf of that account.
-   - **Step B (OpenRouter AI Fallback)**: If no keyword matches, the bot displays Telegram's native `typing...` indicator and generates a 2-sentence conversational response using OpenRouter AI.
-4. **Isolated Controls**: Each connected account gets its own independent card on the web dashboard to configure custom triggers, toggle AI fallback, select AI models, or pause auto-replies.
-5. **Persistent Bulk Update Tool**: Synchronize triggers and AI fallback across ALL connected accounts in a single click.
+1. **Multi-Account Concurrency via Telegram Business**:
+   - Single `@BotFather` bot handles unlimited connected personal Telegram accounts.
+   - Each account has completely isolated settings, trigger rules, AI fallback choices, and message counters.
+2. **Database Persistence (MongoDB)**:
+   - Built using non-blocking async **Motor** (`motor.motor_asyncio`).
+   - Persists all account configurations, custom triggers, AI model selections, and audit message logs.
+   - Restores all accounts into a fast in-memory cache on startup for sub-millisecond response latency.
+3. **Interactive Telegram DM Setup Wizard**:
+   - Send `/settings` or `/start` to the bot in private DM.
+   - **Account Picker**: Interactive menu listing all connected accounts with active status indicators.
+   - **Account Settings Panel**: Toggle AI fallback ON/OFF, toggle auto-responding status, view/add triggers, pick AI models, and inspect analytics.
+4. **Dual Responding Pipeline**:
+   - **Step A (Triggers)**: Predefined keyword containment matching (`.lower()`).
+   - **Step B (OpenRouter AI Fallback)**: Sends Telegram's native `typing...` action indicator and generates a 2-sentence conversational response via OpenRouter API.
+5. **Real-Time Web Dashboard**:
+   - Served directly on root `GET /` with live status indicators, bulk synchronization tools, and per-account settings forms.
+
+---
+
+## 🗄️ Database Architecture (MongoDB)
+
+| Collection | Key Fields | Purpose |
+|---|---|---|
+| `accounts` | `_id (user_id)`, `connection_id`, `username`, `triggers`, `ai_fallback`, `model`, `active`, `processed_count` | Stores account settings, triggers, and state. |
+| `message_logs` | `account_id`, `customer_id`, `incoming_text`, `response_type`, `matched_keyword`, `ai_model`, `response_text`, `timestamp` | Detailed interaction audit logs and analytics. |
+| `bot_settings` | `_id ("global")`, `default_triggers_raw`, `default_model` | Global fallback presets. |
+
+---
+
+## 🤖 Telegram DM Setup Wizard Blueprint
+
+Send `/settings` to the bot in a private chat to access the wizard:
+
+```text
+┌───────────────────────────────────────────────┐
+│ ⚙️ Manage Account Settings                    │
+│ 👉 Select the account whose settings to edit: │
+│                                               │
+│ [ ✅ 👤 @alice (14 DMs)                     ] │
+│ [ ⏸️ 👤 @bob (5 DMs)                        ] │
+│ [ 🔄 Refresh List  ] [ ⚡ Bulk Sync All      ] │
+│ [ 📊 System Stats  ] [ ❌ Close Menu         ] │
+└───────────────────────────────────────────────┘
+                        │
+                        ▼ (Tap an account)
+┌───────────────────────────────────────────────┐
+│ ⚙️ SETTINGS                                   │
+│ Account: @alice (Alice)                       │
+│ • Status: Active ✅ (Replying to DMs)         │
+│ • AI Fallback: ✅ ENABLED                     │
+│ • AI Model: google/gemini-2.5-flash           │
+│ • Predefined Triggers: 3 active rule(s)       │
+│ • DMs Auto-Responded: 14                      │
+│                                               │
+│ [ 🤖 AI Fallback: ON  ] [ ⚡ Status: ACTIVE  ] │
+│ [ 📝 View Triggers    ] [ ➕ Add Trigger     ] │
+│ [ 🧠 Change Model     ] [ 📊 Analytics       ] │
+│ [ ⬅️ Back to Accounts ] [ 🔄 Reload          ] │
+└───────────────────────────────────────────────┘
+```
 
 ---
 
@@ -29,13 +79,14 @@ Runs seamlessly on the **Render Free Tier** (0.1 vCPU, 500MB RAM) with an ultra-
 - Python 3.10+
 - 1 Bot Token from [@BotFather](https://t.me/BotFather)
 - 1 API Key from [OpenRouter](https://openrouter.ai/keys)
+- MongoDB Connection String (MongoDB Atlas free cluster or local)
 
 ### 2. Enable Business Mode in @BotFather
 1. Open [@BotFather](https://t.me/BotFather) on Telegram.
 2. Send `/mybots` and select your bot.
 3. Tap **Bot Settings** → **Telegram Business** → Turn ON **"Connect to Business"**.
 
-### 3. Installation & Run
+### 3. Installation
 ```bash
 git clone https://github.com/DKT882/tgAutometa.git
 cd tgAutometa
@@ -46,42 +97,30 @@ Create `.env`:
 ```ini
 BOT_TOKEN=7123456789:AAHxxxxxxxxxxxxxxxxxxxx
 OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxx
+MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/?retryWrites=true&w=majority
 PORT=8000
 ```
 
 Start the application:
 ```bash
 python main.py
-# or
-uvicorn main:app --host 0.0.0.0 --port 8000
 ```
-Open [http://localhost:8000](http://localhost:8000) to view the real-time control dashboard.
-
----
-
-## 🔗 Connecting Accounts
-
-Each personal Telegram account you want to manage simply connects to the bot:
-1. In the Telegram app, go to **Settings** → **Telegram Business** → **Chatbots**.
-2. Enter your bot's username (e.g. `@YourBot`).
-3. Check the box **"Reply to messages"**.
-4. The account will immediately appear as a card on your web dashboard!
 
 ---
 
 ## ☁️ Deploying to Render Free Tier
 
-1. Push your repository to GitHub.
-2. Create a **New Web Service** on [Render](https://render.com) and link the repo.
-3. Configure:
+1. Create a **New Web Service** on [Render](https://render.com) and link the repo.
+2. Configure:
    - **Environment**: Python 3
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port $PORT`
    - **Health Check Path**: `/health`
-4. Add **Environment Variables**:
+3. Add **Environment Variables**:
    - `BOT_TOKEN`: Your `@BotFather` bot token.
    - `OPENROUTER_API_KEY`: Your OpenRouter API key.
-5. Deploy! Your dashboard and multi-account auto-responder will run 24/7.
+   - `MONGO_URI`: Your MongoDB connection URI.
+4. Deploy! Your dashboard and Telegram DM wizard will run 24/7.
 
 ---
 

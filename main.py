@@ -1,10 +1,11 @@
 """
 Telegram Business Multi-Account Auto-Responder Framework
-Production-ready single-file FastAPI + Telegram Business Bot API service.
-Zero API_ID/API_HASH required — powered by a single @BotFather Bot Token.
+Production-ready single-file FastAPI + Telegram Business Bot API + MongoDB persistence.
+Includes interactive Telegram DM Setup Wizard & Real-Time Server-Side Web Dashboard.
 """
 
 import asyncio
+from datetime import datetime, timezone
 import html
 import logging
 import os
@@ -12,9 +13,10 @@ import sys
 import urllib.parse
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
+import motor.motor_asyncio
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -37,9 +39,13 @@ OPENROUTER_API_KEY = (
     os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
 ).strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_AI_MODEL", "google/gemini-2.5-flash").strip()
+MONGO_URI = (
+    os.getenv("MONGO_URI") or os.getenv("MONGODB_URI") or os.getenv("MONGO_URL") or ""
+).strip()
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "tg_business_autoresponder").strip()
 PORT = int(os.getenv("PORT", 8000))
 
-# Shared HTTPX AsyncClient instance across the entire application lifecycle
+# Shared HTTPX AsyncClient and Bot identity
 http_client: Optional[httpx.AsyncClient] = None
 bot_info: Dict[str, str] = {"username": "BotFatherBot", "first_name": "Business Bot"}
 polling_task: Optional[asyncio.Task] = None
@@ -50,6 +56,172 @@ DEFAULT_TRIGGERS_RAW = (
     "pricing:Our services start at $19/mo. For custom tiers, contact our team!,\n"
     "support:You can reach out to our support team at support@example.com."
 )
+
+# User session state for interactive Telegram DM Wizard
+# e.g., {user_id: {"action": "awaiting_trigger", "target_account_id": 123456}}
+user_wizard_state: Dict[int, Dict[str, Any]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Database Layer (MongoDB via Motor async driver)
+# ---------------------------------------------------------------------------
+class DatabaseManager:
+    """
+    Manages non-blocking async persistence with MongoDB.
+    Maintains collections for accounts, audit message logs, and global settings.
+    """
+
+    def __init__(self):
+        self.client: Optional[motor.motor_asyncio.AsyncIOMotorClient] = None
+        self.db = None
+        self.accounts_col = None
+        self.logs_col = None
+        self.settings_col = None
+        self.connected = False
+
+    async def connect(self):
+        if not MONGO_URI:
+            logger.warning(
+                "MONGO_URI not configured. Operating in in-memory mode with volatile persistence."
+            )
+            return
+
+        try:
+            logger.info("Connecting to MongoDB cluster...")
+            self.client = motor.motor_asyncio.AsyncIOMotorClient(
+                MONGO_URI,
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=5000,
+                maxPoolSize=25,
+                minPoolSize=2,
+            )
+            # Ping database to verify connection
+            await self.client.admin.command("ping")
+            self.db = self.client[MONGO_DB_NAME]
+            self.accounts_col = self.db["accounts"]
+            self.logs_col = self.db["message_logs"]
+            self.settings_col = self.db["bot_settings"]
+
+            # Initialize database indexes
+            await self.accounts_col.create_index("connection_id", sparse=True)
+            await self.accounts_col.create_index("username")
+            await self.logs_col.create_index([("account_id", 1), ("timestamp", -1)])
+            await self.logs_col.create_index("timestamp")
+
+            self.connected = True
+            logger.info(
+                f"[DB] Successfully connected to MongoDB database '{MONGO_DB_NAME}'. Indexes verified."
+            )
+        except Exception as exc:
+            self.connected = False
+            logger.error(
+                f"[DB] Failed to connect to MongoDB: {exc}. Falling back to in-memory mode.",
+                exc_info=False,
+            )
+
+    async def close(self):
+        if self.client:
+            self.client.close()
+            logger.info("[DB] MongoDB client connection pool closed.")
+
+    async def load_all_accounts(self) -> List[dict]:
+        if not self.connected or self.accounts_col is None:
+            return []
+        try:
+            cursor = self.accounts_col.find({})
+            return await cursor.to_list(length=100)
+        except Exception as exc:
+            logger.error(f"[DB] Error loading accounts from MongoDB: {exc}")
+            return []
+
+    async def save_account(self, account: "ConnectedAccount"):
+        if not self.connected or self.accounts_col is None:
+            return
+        try:
+            doc = {
+                "_id": account.user_id,
+                "user_id": account.user_id,
+                "connection_id": account.connection_id,
+                "username": account.username,
+                "first_name": account.first_name,
+                "can_reply": account.can_reply,
+                "is_enabled": account.is_enabled,
+                "active": account.active,
+                "triggers_raw": account.triggers_raw,
+                "triggers": account.triggers,
+                "ai_fallback": account.ai_fallback,
+                "model": account.model,
+                "processed_count": account.processed_count,
+                "updated_at": datetime.now(timezone.utc),
+            }
+            await self.accounts_col.update_one(
+                {"_id": account.user_id},
+                {"$set": doc, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
+                upsert=True,
+            )
+        except Exception as exc:
+            logger.error(f"[DB] Failed to save account {account.user_id}: {exc}")
+
+    async def increment_processed_count(self, user_id: int):
+        if not self.connected or self.accounts_col is None:
+            return
+        try:
+            await self.accounts_col.update_one(
+                {"_id": user_id},
+                {
+                    "$inc": {"processed_count": 1},
+                    "$set": {"updated_at": datetime.now(timezone.utc)},
+                },
+            )
+        except Exception as exc:
+            logger.error(f"[DB] Failed to increment count for user {user_id}: {exc}")
+
+    async def log_interaction(
+        self,
+        account_id: int,
+        customer_id: int,
+        customer_name: str,
+        incoming_text: str,
+        response_type: str,
+        response_text: str,
+        matched_keyword: Optional[str] = None,
+        ai_model: Optional[str] = None,
+    ):
+        if not self.connected or self.logs_col is None:
+            return
+        try:
+            log_doc = {
+                "account_id": account_id,
+                "customer_id": customer_id,
+                "customer_name": customer_name,
+                "incoming_text": incoming_text[:500],
+                "response_type": response_type,
+                "matched_keyword": matched_keyword,
+                "ai_model": ai_model,
+                "response_text": response_text[:1000],
+                "timestamp": datetime.now(timezone.utc),
+            }
+            await self.logs_col.insert_one(log_doc)
+        except Exception as exc:
+            logger.error(f"[DB] Failed to record message audit log: {exc}")
+
+    async def get_account_stats(self, account_id: int) -> dict:
+        if not self.connected or self.logs_col is None:
+            return {"total": 0, "triggers": 0, "ai": 0}
+        try:
+            total = await self.logs_col.count_documents({"account_id": account_id})
+            triggers = await self.logs_col.count_documents(
+                {"account_id": account_id, "response_type": "trigger"}
+            )
+            ai = await self.logs_col.count_documents(
+                {"account_id": account_id, "response_type": "ai_fallback"}
+            )
+            return {"total": total, "triggers": triggers, "ai": ai}
+        except Exception:
+            return {"total": 0, "triggers": 0, "ai": 0}
+
+
+db_manager = DatabaseManager()
 
 
 # ---------------------------------------------------------------------------
@@ -265,8 +437,14 @@ async def process_business_message(message: dict):
     if not raw_text or not chat_id:
         return
 
+    customer_name = (
+        f"{sender.get('first_name', '')} {sender.get('last_name', '')}".strip()
+        or sender.get("username", "")
+        or str(sender_id)
+    )
+
     logger.info(
-        f"[Account @{account.username or account.user_id}] Incoming DM from {sender_id}: '{raw_text[:50]}...'"
+        f"[Account @{account.username or account.user_id}] Incoming DM from {customer_name}: '{raw_text[:50]}...'"
     )
 
     # -----------------------------------------------------------------------
@@ -291,6 +469,19 @@ async def process_business_message(message: dict):
         )
         if success:
             account.processed_count += 1
+            # Persist counter and message log asynchronously in MongoDB
+            asyncio.create_task(db_manager.increment_processed_count(account.user_id))
+            asyncio.create_task(
+                db_manager.log_interaction(
+                    account_id=account.user_id,
+                    customer_id=sender_id,
+                    customer_name=customer_name,
+                    incoming_text=raw_text,
+                    response_type="trigger",
+                    response_text=matched_reply,
+                    matched_keyword=matched_keyword,
+                )
+            )
         return
 
     # -----------------------------------------------------------------------
@@ -317,6 +508,21 @@ async def process_business_message(message: dict):
             )
             if success:
                 account.processed_count += 1
+                # Persist counter and message log asynchronously in MongoDB
+                asyncio.create_task(
+                    db_manager.increment_processed_count(account.user_id)
+                )
+                asyncio.create_task(
+                    db_manager.log_interaction(
+                        account_id=account.user_id,
+                        customer_id=sender_id,
+                        customer_name=customer_name,
+                        incoming_text=raw_text,
+                        response_type="ai_fallback",
+                        response_text=ai_reply,
+                        ai_model=account.model,
+                    )
+                )
                 logger.info(
                     f"[Account @{account.username or account.user_id}] AI reply delivered to sender {sender_id}."
                 )
@@ -378,6 +584,384 @@ async def process_business_connection(conn: dict):
             f"[Connected] New Business Account linked: @{username} (ID: {user_id}), can_reply={can_reply}"
         )
 
+    # Persist in MongoDB
+    await db_manager.save_account(account)
+
+
+# ---------------------------------------------------------------------------
+# Interactive Telegram DM Setup Wizard (Matches Provided UI Blueprint)
+# ---------------------------------------------------------------------------
+def build_accounts_menu() -> tuple[str, list]:
+    """
+    Screen 1: Main accounts selection menu (inspired by image 1).
+    """
+    text = (
+        "<b>⚙️ Manage Account Settings</b>\n"
+        "👉 <i>Select the account whose settings you want to change.</i>\n\n"
+        "If an account doesn't appear here:\n"
+        "• Open Telegram <b>Settings</b> ➔ <b>Telegram Business</b> ➔ <b>Chatbots</b>\n"
+        f"• Add @{bot_info.get('username')} and enable <b>'Reply to messages'</b>\n"
+        "• Press <b>'🔄 Refresh List'</b> below."
+    )
+
+    keyboard = []
+    if not accounts:
+        keyboard.append(
+            [
+                {
+                    "text": "ℹ️ No Accounts Connected Yet",
+                    "callback_data": "noop",
+                }
+            ]
+        )
+    else:
+        for uid, acc in accounts.items():
+            name_label = f"👤 @{acc.username}" if acc.username else f"👤 {acc.first_name}"
+            status_dot = "✅" if (acc.active and acc.can_reply) else "⏸️"
+            keyboard.append(
+                [
+                    {
+                        "text": f"{status_dot} {name_label} ({acc.processed_count} DMs)",
+                        "callback_data": f"acc_{uid}",
+                    }
+                ]
+            )
+
+    keyboard.append(
+        [
+            {"text": "🔄 Refresh List", "callback_data": "refresh_list"},
+            {"text": "⚡ Bulk Sync All", "callback_data": "bulk_sync_menu"},
+        ]
+    )
+    keyboard.append(
+        [
+            {"text": "📊 System Stats", "callback_data": "sys_stats"},
+            {"text": "❌ Close Menu", "callback_data": "close_menu"},
+        ]
+    )
+
+    return text, keyboard
+
+
+def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
+    """
+    Screen 2: Detailed Account Settings panel (inspired by image 2).
+    """
+    status_text = "Active ✅ (Replying)" if (acc.active and acc.can_reply) else "Paused ⏸️"
+    ai_status = "✅ ENABLED" if acc.ai_fallback else "❌ DISABLED"
+    triggers_count = len(acc.triggers)
+
+    text = (
+        f"<b>SETTINGS</b>\n"
+        f"<b>Account:</b> @{html.escape(acc.username or str(acc.user_id))} ({html.escape(acc.first_name)})\n\n"
+        f"• <b>Status:</b> {status_text}\n"
+        f"• <b>AI Fallback:</b> {ai_status}\n"
+        f"• <b>AI Model:</b> <code>{html.escape(acc.model)}</code>\n"
+        f"• <b>Predefined Triggers:</b> {triggers_count} active rule(s)\n"
+        f"• <b>DMs Auto-Responded:</b> {acc.processed_count}\n\n"
+        f"<i>Select one of the settings that you want to change:</i>"
+    )
+
+    ai_btn_text = "🤖 AI Fallback: ON" if acc.ai_fallback else "🤖 AI Fallback: OFF"
+    active_btn_text = "⚡ Status: ACTIVE" if acc.active else "⚡ Status: PAUSED"
+
+    keyboard = [
+        [
+            {"text": ai_btn_text, "callback_data": f"tog_ai_{acc.user_id}"},
+            {"text": active_btn_text, "callback_data": f"tog_act_{acc.user_id}"},
+        ],
+        [
+            {"text": "📝 View Triggers", "callback_data": f"view_trig_{acc.user_id}"},
+            {"text": "➕ Add Trigger", "callback_data": f"add_trig_{acc.user_id}"},
+        ],
+        [
+            {"text": "🧠 Change Model", "callback_data": f"pick_mod_{acc.user_id}"},
+            {"text": "📊 Analytics", "callback_data": f"acc_stats_{acc.user_id}"},
+        ],
+        [
+            {"text": "⬅️ Back", "callback_data": "back_to_accounts"},
+            {"text": "✅ Close", "callback_data": "close_menu"},
+            {"text": "🔄 Reload", "callback_data": f"acc_{acc.user_id}"},
+        ],
+    ]
+
+    return text, keyboard
+
+
+async def handle_callback_query(cq: dict):
+    """
+    Processes all inline button clicks inside Telegram DM wizard.
+    """
+    cq_id = cq["id"]
+    from_user = cq.get("from", {})
+    from_user_id = from_user.get("id")
+    chat_id = cq.get("message", {}).get("chat", {}).get("id")
+    message_id = cq.get("message", {}).get("message_id")
+    data = cq.get("data", "")
+
+    async def answer(text: str = "", alert: bool = False):
+        await tg_api_call(
+            "answerCallbackQuery",
+            {"callback_query_id": cq_id, "text": text, "show_alert": alert},
+        )
+
+    async def edit(text: str, keyboard: list):
+        await tg_api_call(
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": {"inline_keyboard": keyboard},
+            },
+        )
+
+    if data == "noop":
+        await answer()
+        return
+
+    if data == "close_menu":
+        await answer("Menu closed.")
+        await tg_api_call(
+            "deleteMessage", {"chat_id": chat_id, "message_id": message_id}
+        )
+        return
+
+    if data in ("back_to_accounts", "refresh_list"):
+        text, kb = build_accounts_menu()
+        await edit(text, kb)
+        await answer("List updated.")
+        return
+
+    if data == "sys_stats":
+        active_count = sum(1 for a in accounts.values() if a.active and a.can_reply)
+        total_dms = sum(a.processed_count for a in accounts.values())
+        db_status = "Connected ✅" if db_manager.connected else "In-Memory (Volatile) ⚠️"
+        stat_text = (
+            f"<b>📊 SYSTEM ANALYTICS & STATUS</b>\n\n"
+            f"• <b>Bot Username:</b> @{html.escape(bot_info.get('username', ''))}\n"
+            f"• <b>Total Connected Accounts:</b> {len(accounts)}\n"
+            f"• <b>Active Auto-Responders:</b> {active_count}\n"
+            f"• <b>Total Messages Handled:</b> {total_dms}\n"
+            f"• <b>MongoDB Persistence:</b> {db_status}\n"
+            f"• <b>OpenRouter API:</b> {'Ready ✅' if OPENROUTER_API_KEY else 'Not Set ❌'}\n"
+        )
+        kb = [[{"text": "⬅️ Back", "callback_data": "back_to_accounts"}]]
+        await edit(stat_text, kb)
+        await answer()
+        return
+
+    if data == "bulk_sync_menu":
+        confirm_text = (
+            "<b>⚡ Bulk Synchronization Tool</b>\n\n"
+            "This action will overwrite keyword triggers, AI fallback toggle, "
+            "and default AI models across <b>ALL</b> connected accounts simultaneously.\n\n"
+            "Do you want to proceed?"
+        )
+        kb = [
+            [
+                {
+                    "text": "✅ Yes, Sync All Accounts",
+                    "callback_data": "confirm_bulk_sync",
+                }
+            ],
+            [{"text": "⬅️ Cancel", "callback_data": "back_to_accounts"}],
+        ]
+        await edit(confirm_text, kb)
+        await answer()
+        return
+
+    if data == "confirm_bulk_sync":
+        default_parsed = parse_triggers(DEFAULT_TRIGGERS_RAW)
+        for acc in accounts.values():
+            acc.triggers_raw = DEFAULT_TRIGGERS_RAW
+            acc.triggers = default_parsed
+            acc.ai_fallback = True
+            acc.model = DEFAULT_MODEL
+            await db_manager.save_account(acc)
+        await answer("All accounts synchronized successfully!", alert=True)
+        text, kb = build_accounts_menu()
+        await edit(text, kb)
+        return
+
+    # Account Specific Routes
+    if data.startswith("acc_"):
+        uid = int(data.split("_")[1])
+        acc = accounts.get(uid)
+        if not acc:
+            await answer("Account not found.", alert=True)
+            return
+        text, kb = build_account_settings_menu(acc)
+        await edit(text, kb)
+        await answer()
+        return
+
+    # Toggle AI Fallback
+    if data.startswith("tog_ai_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if acc:
+            acc.ai_fallback = not acc.ai_fallback
+            await db_manager.save_account(acc)
+            status_msg = "AI Fallback Enabled" if acc.ai_fallback else "AI Fallback Disabled"
+            await answer(status_msg)
+            text, kb = build_account_settings_menu(acc)
+            await edit(text, kb)
+        return
+
+    # Toggle Active Status
+    if data.startswith("tog_act_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if acc:
+            acc.active = not acc.active
+            await db_manager.save_account(acc)
+            status_msg = "Auto-Responder Resumed" if acc.active else "Auto-Responder Paused"
+            await answer(status_msg)
+            text, kb = build_account_settings_menu(acc)
+            await edit(text, kb)
+        return
+
+    # Pick Model Menu
+    if data.startswith("pick_mod_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if not acc:
+            return
+        mod_text = (
+            f"<b>🧠 Select AI Model for @{html.escape(acc.username or str(uid))}</b>\n\n"
+            f"Current: <code>{html.escape(acc.model)}</code>\n\n"
+            f"Choose a low-latency model optimized for Telegram DMs:"
+        )
+        kb = [
+            [
+                {
+                    "text": "⚡ Gemini 2.5 Flash",
+                    "callback_data": f"setmod_{uid}_google/gemini-2.5-flash",
+                },
+                {
+                    "text": "🦙 LLaMA 3.3 70B",
+                    "callback_data": f"setmod_{uid}_meta-llama/llama-3.3-70b-instruct:free",
+                },
+            ],
+            [
+                {
+                    "text": "🧠 Claude 3.5 Haiku",
+                    "callback_data": f"setmod_{uid}_anthropic/claude-3.5-haiku",
+                },
+                {
+                    "text": "🤖 GPT-4o Mini",
+                    "callback_data": f"setmod_{uid}_openai/gpt-4o-mini",
+                },
+            ],
+            [{"text": "⬅️ Back to Settings", "callback_data": f"acc_{uid}"}],
+        ]
+        await edit(mod_text, kb)
+        await answer()
+        return
+
+    # Set Model Action
+    if data.startswith("setmod_"):
+        parts = data.split("_", 2)
+        uid = int(parts[1])
+        selected_model = parts[2]
+        acc = accounts.get(uid)
+        if acc:
+            acc.model = selected_model
+            await db_manager.save_account(acc)
+            await answer(f"Model updated to: {selected_model}", alert=True)
+            text, kb = build_account_settings_menu(acc)
+            await edit(text, kb)
+        return
+
+    # View Triggers
+    if data.startswith("view_trig_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if not acc:
+            return
+        trig_list_text = (
+            f"<b>📝 Active Trigger Rules for @{html.escape(acc.username or str(uid))}</b>\n\n"
+        )
+        if not acc.triggers:
+            trig_list_text += "<i>No triggers configured. Messages default to AI fallback.</i>"
+        else:
+            for idx, (kw, resp) in enumerate(acc.triggers.items(), 1):
+                trig_list_text += f"{idx}. <b>\"{html.escape(kw)}\"</b> ➔ <i>{html.escape(resp[:60])}...</i>\n"
+
+        kb = [
+            [
+                {
+                    "text": "➕ Add / Replace Trigger",
+                    "callback_data": f"add_trig_{uid}",
+                },
+                {
+                    "text": "🔄 Reset Defaults",
+                    "callback_data": f"reset_trig_{uid}",
+                },
+            ],
+            [{"text": "⬅️ Back to Settings", "callback_data": f"acc_{uid}"}],
+        ]
+        await edit(trig_list_text, kb)
+        await answer()
+        return
+
+    # Reset Triggers
+    if data.startswith("reset_trig_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if acc:
+            acc.triggers_raw = DEFAULT_TRIGGERS_RAW
+            acc.triggers = parse_triggers(DEFAULT_TRIGGERS_RAW)
+            await db_manager.save_account(acc)
+            await answer("Triggers reset to default.", alert=True)
+            text, kb = build_account_settings_menu(acc)
+            await edit(text, kb)
+        return
+
+    # Add Trigger (Prompt for text input)
+    if data.startswith("add_trig_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if not acc:
+            return
+        user_wizard_state[from_user_id] = {
+            "action": "awaiting_trigger",
+            "target_account_id": uid,
+        }
+        prompt_text = (
+            f"<b>➕ Add Custom Trigger for @{html.escape(acc.username or str(uid))}</b>\n\n"
+            f"Send your trigger rule in your next chat message using the format:\n"
+            f"<code>keyword:response text</code>\n\n"
+            f"<b>Example:</b>\n"
+            f"<code>support:Please email our team at help@example.com</code>"
+        )
+        kb = [[{"text": "⬅️ Cancel", "callback_data": f"acc_{uid}"}]]
+        await edit(prompt_text, kb)
+        await answer()
+        return
+
+    # Account Analytics
+    if data.startswith("acc_stats_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if not acc:
+            return
+        stats = await db_manager.get_account_stats(uid)
+        stat_text = (
+            f"<b>📊 Account Analytics: @{html.escape(acc.username or str(uid))}</b>\n\n"
+            f"• <b>Total DMs Processed:</b> {acc.processed_count}\n"
+            f"• <b>Trigger Keyword Matches:</b> {stats.get('triggers', 0)}\n"
+            f"• <b>AI Generated Fallbacks:</b> {stats.get('ai', 0)}\n"
+            f"• <b>Configured Model:</b> <code>{html.escape(acc.model)}</code>\n"
+            f"• <b>Active Status:</b> {'Replying ✅' if acc.active else 'Paused ⏸️'}\n"
+        )
+        kb = [[{"text": "⬅️ Back to Settings", "callback_data": f"acc_{uid}"}]]
+        await edit(stat_text, kb)
+        await answer()
+        return
+
 
 # ---------------------------------------------------------------------------
 # Background Polling Worker
@@ -385,12 +969,14 @@ async def process_business_connection(conn: dict):
 async def run_bot_polling():
     """
     Long-polling worker fetching updates from Telegram Bot API.
-    Handles standard messages, business connections, and business DMs.
+    Handles standard messages, callbacks, business connections, and business DMs.
     """
     global http_client
     offset = 0
     allowed_updates = [
         "message",
+        "edited_message",
+        "callback_query",
         "business_connection",
         "business_message",
         "edited_business_message",
@@ -425,30 +1011,93 @@ async def run_bot_polling():
             for update in updates:
                 offset = update["update_id"] + 1
 
-                # 1. Telegram Business Connection Update
-                if "business_connection" in update:
+                # 1. Inline Keyboard Button Click (Setup Wizard)
+                if "callback_query" in update:
+                    await handle_callback_query(update["callback_query"])
+
+                # 2. Telegram Business Connection Update
+                elif "business_connection" in update:
                     await process_business_connection(update["business_connection"])
 
-                # 2. Telegram Business Message Update (Incoming DMs on connected accounts)
+                # 3. Telegram Business Message Update (Incoming DMs on connected accounts)
                 elif "business_message" in update:
                     await process_business_message(update["business_message"])
 
-                # 3. Direct Message to the Bot itself (Help & Connection Instructions)
+                # 4. Direct Message to the Bot itself (Commands & Text Input Wizard)
                 elif "message" in update:
                     msg = update["message"]
                     chat_id = msg.get("chat", {}).get("id")
-                    text = msg.get("text", "")
-                    if text.startswith("/start") or text.startswith("/help"):
+                    from_user = msg.get("from", {})
+                    from_user_id = from_user.get("id")
+                    text = (msg.get("text") or "").strip()
+
+                    # Handle Wizard Text Input (e.g. adding a trigger rule)
+                    if from_user_id in user_wizard_state:
+                        state = user_wizard_state.pop(from_user_id)
+                        if state.get("action") == "awaiting_trigger":
+                            target_id = state.get("target_account_id")
+                            acc = accounts.get(target_id)
+                            if acc and ":" in text:
+                                kw, resp_val = text.split(":", 1)
+                                kw = kw.strip().lower()
+                                resp_val = resp_val.strip()
+                                if kw and resp_val:
+                                    acc.triggers[kw] = resp_val
+                                    acc.triggers_raw += f",\n{kw}:{resp_val}"
+                                    await db_manager.save_account(acc)
+                                    confirm = (
+                                        f"✅ <b>Trigger Saved!</b>\n\n"
+                                        f"Keyword: <code>{html.escape(kw)}</code>\n"
+                                        f"Reply: <i>{html.escape(resp_val)}</i>"
+                                    )
+                                    kb = [
+                                        [
+                                            {
+                                                "text": "⬅️ Back to Settings",
+                                                "callback_data": f"acc_{target_id}",
+                                            }
+                                        ]
+                                    ]
+                                    await tg_api_call(
+                                        "sendMessage",
+                                        {
+                                            "chat_id": chat_id,
+                                            "text": confirm,
+                                            "parse_mode": "HTML",
+                                            "reply_markup": {"inline_keyboard": kb},
+                                        },
+                                    )
+                                    continue
+
+                    # Commands
+                    if text.startswith(("/start", "/settings", "/menu")):
+                        menu_text, menu_kb = build_accounts_menu()
+                        await tg_api_call(
+                            "sendMessage",
+                            {
+                                "chat_id": chat_id,
+                                "text": menu_text,
+                                "parse_mode": "HTML",
+                                "reply_markup": {"inline_keyboard": menu_kb},
+                            },
+                        )
+                    elif text.startswith("/help"):
                         help_text = (
-                            f"👋 Hello! I am your Multi-Account Business Auto-Responder.\n\n"
-                            f"📌 To connect me to your personal Telegram account:\n"
-                            f"1. Open Telegram Settings -> Telegram Business -> Chatbots\n"
+                            f"👋 <b>Welcome to Multi-Account AutoResponder!</b>\n\n"
+                            f"📌 <b>Connect your Telegram Account:</b>\n"
+                            f"1. Open Telegram <b>Settings</b> ➔ <b>Telegram Business</b> ➔ <b>Chatbots</b>\n"
                             f"2. Add @{bot_info.get('username')}\n"
-                            f"3. Enable 'Reply to messages'\n"
-                            f"4. Access the web dashboard to customize triggers and AI fallback!\n"
+                            f"3. Enable <b>'Reply to messages'</b>\n\n"
+                            f"⚙️ Send /settings to open your interactive management wizard!\n"
+                            f"🌐 You can also configure everything via your web dashboard."
                         )
                         await tg_api_call(
-                            "sendMessage", {"chat_id": chat_id, "text": help_text}
+                            "sendMessage",
+                            {
+                                "chat_id": chat_id,
+                                "text": help_text,
+                                "parse_mode": "HTML",
+                            },
                         )
 
         except asyncio.CancelledError:
@@ -467,10 +1116,40 @@ async def run_bot_polling():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Manages connection pooling and background worker tasks cleanly.
+    Manages database connection pool, global HTTP client, and polling workers cleanly.
     """
     global http_client, bot_info, polling_task
 
+    # 1. Initialize MongoDB connection
+    await db_manager.connect()
+
+    # 2. Load persisted accounts from MongoDB into in-memory cache
+    persisted_accounts = await db_manager.load_all_accounts()
+    for doc in persisted_accounts:
+        uid = doc["_id"]
+        acc = ConnectedAccount(
+            connection_id=doc.get("connection_id", ""),
+            user_id=uid,
+            username=doc.get("username", ""),
+            first_name=doc.get("first_name", ""),
+            can_reply=doc.get("can_reply", True),
+            is_enabled=doc.get("is_enabled", True),
+            triggers_raw=doc.get("triggers_raw", DEFAULT_TRIGGERS_RAW),
+            triggers=doc.get("triggers") or parse_triggers(DEFAULT_TRIGGERS_RAW),
+            ai_fallback=doc.get("ai_fallback", True),
+            model=doc.get("model", DEFAULT_MODEL),
+            active=doc.get("active", True),
+            processed_count=doc.get("processed_count", 0),
+        )
+        accounts[uid] = acc
+        if acc.connection_id:
+            connection_to_user[acc.connection_id] = uid
+
+    logger.info(
+        f"[Init] Loaded {len(accounts)} persisted account(s) into memory cache."
+    )
+
+    # 3. Initialize HTTPX client
     logger.info("Initializing global HTTPX async client (pool max: 25)...")
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(25.0, connect=5.0),
@@ -509,6 +1188,8 @@ async def lifespan(app: FastAPI):
     if http_client:
         await http_client.aclose()
         logger.info("Global HTTPX client closed.")
+
+    await db_manager.close()
     logger.info("Shutdown completed cleanly.")
 
 
@@ -549,7 +1230,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 <li>Add your bot: <code>@{html.escape(bot_info.get("username", "your_bot"))}</code></li>
                 <li>Check the box <strong>"Reply to messages"</strong> and tap Save.</li>
             </ol>
-            <p class="empty-note">Once linked, the account will instantly appear here with full controls!</p>
+            <p class="empty-note">Once linked, the account will instantly appear here and in your Telegram DM /settings wizard!</p>
         </div>
         """
     else:
@@ -632,6 +1313,9 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
         list(accounts.values())[0].triggers_raw if accounts else DEFAULT_TRIGGERS_RAW
     )
     bulk_model = list(accounts.values())[0].model if accounts else DEFAULT_MODEL
+
+    db_badge_color = "#4ade80" if db_manager.connected else "#fbbf24"
+    db_badge_text = "Connected (MongoDB)" if db_manager.connected else "Volatile (In-Memory)"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1056,7 +1740,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 <div class="brand-icon">🤖</div>
                 <div class="brand-text">
                     <h1>Telegram Business AutoResponder</h1>
-                    <p>Multi-Account Manager powered by @BotFather & Telegram Business API</p>
+                    <p>Multi-Account Manager with Telegram DM Wizard & MongoDB</p>
                 </div>
             </div>
             <div class="stats-bar">
@@ -1069,12 +1753,12 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                     <span class="stat-value">{active_count} / {total_accounts} Active</span>
                 </div>
                 <div class="stat-chip">
-                    <span>OpenRouter:</span>
-                    <span class="stat-value" style="color: {'#4ade80' if OPENROUTER_API_KEY else '#fbbf24'}">{'Ready' if OPENROUTER_API_KEY else 'API Key Missing'}</span>
+                    <span>Database:</span>
+                    <span class="stat-value" style="color: {db_badge_color};">{db_badge_text}</span>
                 </div>
                 <div class="stat-chip">
-                    <span>API_ID/Hash:</span>
-                    <span class="stat-value" style="color: #4ade80;">Not Needed!</span>
+                    <span>OpenRouter:</span>
+                    <span class="stat-value" style="color: {'#4ade80' if OPENROUTER_API_KEY else '#fbbf24'}">{'Ready' if OPENROUTER_API_KEY else 'API Key Missing'}</span>
                 </div>
             </div>
         </header>
@@ -1122,8 +1806,8 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
         </div>
 
         <footer>
-            <div>Operational Health Endpoint: <a href="/health" target="_blank">/health</a> (Render Free Tier Keep-Alive)</div>
-            <div>Powered by FastAPI + Telegram Business Bot API (No API_ID / API_HASH required)</div>
+            <div>Operational Health Endpoint: <a href="/health" target="_blank">/health</a> | Telegram Bot: <a href="https://t.me/{html.escape(bot_info.get('username',''))}" target="_blank">@{html.escape(bot_info.get('username',''))}</a> (/settings wizard)</div>
+            <div>Powered by FastAPI + Telegram Business Bot API + MongoDB</div>
         </footer>
     </div>
 </body>
@@ -1153,6 +1837,7 @@ async def health_check():
         "bot_username": bot_info.get("username"),
         "connected_accounts": len(accounts),
         "active_accounts": active_count,
+        "database_connected": db_manager.connected,
         "openrouter_configured": bool(OPENROUTER_API_KEY),
     }
 
@@ -1175,6 +1860,8 @@ async def bulk_update_accounts(request: Request):
         acc.triggers = parsed_rules
         acc.ai_fallback = ai_fallback
         acc.model = model
+        # Persist to MongoDB
+        await db_manager.save_account(acc)
 
     logger.info(
         f"Bulk update executed: applied {len(parsed_rules)} triggers, AI fallback={ai_fallback}, model='{model}' across {len(accounts)} accounts."
@@ -1203,6 +1890,9 @@ async def update_account_config(user_id: int, request: Request):
     acc.ai_fallback = "ai_fallback" in data
     acc.model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
 
+    # Persist to MongoDB
+    await db_manager.save_account(acc)
+
     logger.info(
         f"[Account @{acc.username or user_id}] Updated: {len(acc.triggers)} triggers, AI fallback={acc.ai_fallback}, model='{acc.model}'"
     )
@@ -1223,6 +1913,9 @@ async def toggle_account_active(user_id: int):
 
     acc = accounts[user_id]
     acc.active = not acc.active
+    # Persist to MongoDB
+    await db_manager.save_account(acc)
+
     status_str = "resumed" if acc.active else "paused"
     logger.info(f"[Account @{acc.username or user_id}] Auto-responder {status_str}.")
     return RedirectResponse(
