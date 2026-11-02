@@ -1,81 +1,87 @@
-# Telegram Multi-Account Auto-Responder Userbot Framework ⚡
+# Telegram Business Multi-Account Auto-Responder Framework ⚡
 
-A high-performance, single-file, production-ready Telegram Userbot Auto-Responder built with **FastAPI**, **Telethon (MTProto API)**, and **HTTPX**.
+A high-performance, single-file Telegram Auto-Responder built with **FastAPI**, **Telegram Business Bot API**, and **HTTPX**.
 
-Specifically architected for low-resource cloud deployments (such as the **Render Free Tier**: 0.1 vCPU, 500MB RAM, 5GB outbound transfer limits) with an in-memory footprint of **< 120MB**.
+Instead of complex `API_ID`, `API_HASH`, or phone session strings, this framework uses **Telegram Business** to connect a single `@BotFather` bot to **unlimited personal Telegram accounts**, managing each account's incoming private DMs completely isolated from each other.
 
----
-
-## 🚀 Features
-
-- **Multi-Account MTProto Concurrency**: Supports up to 5 concurrent Telegram userbot profiles via Telethon's `StringSession`, running background asynchronous client tasks without local SQLite disk storage.
-- **Dual Responding Pipeline**:
-  - **Step A (Predefined Triggers)**: Instant containment keyword matching (`.lower()`) on incoming 1-on-1 private DMs. Groups, supergroups, and channels are strictly ignored.
-  - **Step B (AI Fallback Mode)**: Dispatches unhandled DMs to the **OpenRouter API** using a globally pooled `httpx.AsyncClient` with native Telegram `typing...` chat feedback indicators.
-- **Built-in Server-Side Rendered UI**:
-  - Lightweight, responsive dark-mode dashboard at `/`. Zero external CDN or script dependencies.
-  - Per-account controls: connection toggle (Activate/Deactivate), custom triggers, AI fallback switch, and AI model selection.
-  - **Persistent Bulk Update Tool**: Synchronize rules, AI fallback state, and model configuration across all 5 accounts with one click.
-- **Production Lifecycle & Resiliency**:
-  - Controlled FastAPI `lifespan` management ensures smooth startup and safe disconnection handshakes (`SIGTERM` handling).
-  - Health check endpoint at `/health` for Render continuous uptime monitoring.
+Runs seamlessly on the **Render Free Tier** (0.1 vCPU, 500MB RAM) with an ultra-lightweight memory footprint of **< 50MB RAM**.
 
 ---
 
-## 🛠️ Quick Start
+## 🌟 How It Works (Telegram Business Architecture)
 
-### 1. Prerequisites
+1. You create a single bot with `@BotFather` and run this service with `BOT_TOKEN`.
+2. Any personal Telegram account links your bot in their Telegram app:
+   - Go to **Settings** → **Telegram Business** → **Chatbots**.
+   - Add your bot `@YourBot` and check **"Reply to messages"**.
+3. Once linked:
+   - When customers or friends send private DMs to that personal account, Telegram securely delivers a `business_message` update to your bot.
+   - **Step A (Triggers)**: The bot checks for keyword matches (`.lower()`) and sends instant automated replies directly on behalf of that account.
+   - **Step B (OpenRouter AI Fallback)**: If no keyword matches, the bot displays Telegram's native `typing...` indicator and generates a 2-sentence conversational response using OpenRouter AI.
+4. **Isolated Controls**: Each connected account gets its own independent card on the web dashboard to configure custom triggers, toggle AI fallback, select AI models, or pause auto-replies.
+5. **Persistent Bulk Update Tool**: Synchronize triggers and AI fallback across ALL connected accounts in a single click.
+
+---
+
+## 🚀 Quick Setup
+
+### 1. Requirements
 - Python 3.10+
-- Telegram API ID and Hash from [my.telegram.org](https://my.telegram.org)
-- Telethon `StringSession` strings for your accounts
-- OpenRouter API key from [openrouter.ai](https://openrouter.ai)
+- 1 Bot Token from [@BotFather](https://t.me/BotFather)
+- 1 API Key from [OpenRouter](https://openrouter.ai/keys)
 
-### 2. Installation
+### 2. Enable Business Mode in @BotFather
+1. Open [@BotFather](https://t.me/BotFather) on Telegram.
+2. Send `/mybots` and select your bot.
+3. Tap **Bot Settings** → **Telegram Business** → Turn ON **"Connect to Business"**.
+
+### 3. Installation & Run
 ```bash
 git clone https://github.com/DKT882/tgAutometa.git
 cd tgAutometa
 pip install -r requirements.txt
 ```
 
-### 3. Configuration
-Copy `.env.example` to `.env` and fill in your credentials:
-```bash
-cp .env.example .env
+Create `.env`:
+```ini
+BOT_TOKEN=7123456789:AAHxxxxxxxxxxxxxxxxxxxx
+OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxx
+PORT=8000
 ```
 
-| Variable | Description |
-|---|---|
-| `TELEGRAM_API_ID` | Telegram MTProto API ID |
-| `TELEGRAM_API_HASH` | Telegram MTProto API Hash |
-| `OPENROUTER_API_KEY` | OpenRouter API Key (e.g. `sk-or-...`) |
-| `DEFAULT_AI_MODEL` | Default model string (defaults to `google/gemini-2.5-flash`) |
-| `SESSION_1` to `SESSION_5` | Telethon StringSession tokens for Slots 1–5 |
-| `PORT` | Web port (default: `8000`) |
-
-### 4. Running the Service
+Start the application:
 ```bash
 python main.py
 # or
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
-Open [http://localhost:8000](http://localhost:8000) to view the control dashboard.
+Open [http://localhost:8000](http://localhost:8000) to view the real-time control dashboard.
 
 ---
 
-## ☁️ Deploying to Render
+## 🔗 Connecting Accounts
 
-1. Create a **New Web Service** on Render and link this repository.
-2. Configure settings:
+Each personal Telegram account you want to manage simply connects to the bot:
+1. In the Telegram app, go to **Settings** → **Telegram Business** → **Chatbots**.
+2. Enter your bot's username (e.g. `@YourBot`).
+3. Check the box **"Reply to messages"**.
+4. The account will immediately appear as a card on your web dashboard!
+
+---
+
+## ☁️ Deploying to Render Free Tier
+
+1. Push your repository to GitHub.
+2. Create a **New Web Service** on [Render](https://render.com) and link the repo.
+3. Configure:
    - **Environment**: Python 3
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port $PORT`
    - **Health Check Path**: `/health`
-3. In **Environment Variables**, add:
-   - `TELEGRAM_API_ID`
-   - `TELEGRAM_API_HASH`
-   - `OPENROUTER_API_KEY`
-   - `SESSION_1` (and any other sessions up to `SESSION_5`)
-4. Deploy! Your dashboard will be live at `https://your-app-name.onrender.com`.
+4. Add **Environment Variables**:
+   - `BOT_TOKEN`: Your `@BotFather` bot token.
+   - `OPENROUTER_API_KEY`: Your OpenRouter API key.
+5. Deploy! Your dashboard and multi-account auto-responder will run 24/7.
 
 ---
 
