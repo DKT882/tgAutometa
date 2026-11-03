@@ -197,6 +197,7 @@ class DatabaseManager:
                 "away_mode": account.away_mode,
                 "away_timeout_minutes": account.away_timeout_minutes,
                 "last_owner_activity": account.last_owner_activity,
+                "keyword_triggers": account.keyword_triggers,
                 "trigger_all": account.trigger_all,
                 "custom_message": account.custom_message,
                 "triggers_raw": account.triggers_raw,
@@ -324,8 +325,10 @@ def parse_triggers(raw: str) -> Dict[str, str]:
     """
     Parse comma-separated or newline-separated trigger strings into a dictionary.
     Format: 'keyword:response text'
-    Handles commas embedded inside the response text safely.
+    Handles colons inside URLs (e.g. https://...) and commas inside replies safely.
     """
+    import re
+
     rules: Dict[str, str] = {}
     if not raw:
         return rules
@@ -336,23 +339,16 @@ def parse_triggers(raw: str) -> Dict[str, str]:
         if not line:
             continue
 
-        parts = [p.strip() for p in line.split(",") if p.strip()]
-        current_kw: Optional[str] = None
-        current_resp_parts: List[str] = []
-
-        for part in parts:
-            if ":" in part:
-                if current_kw and current_resp_parts:
-                    rules[current_kw] = ", ".join(current_resp_parts)
-                kw, resp = part.split(":", 1)
-                current_kw = kw.strip().lower()
-                current_resp_parts = [resp.strip()]
-            else:
-                if current_kw:
-                    current_resp_parts.append(part)
-
-        if current_kw and current_resp_parts:
-            rules[current_kw] = ", ".join(current_resp_parts)
+        # Split multiple rules on the same line only if preceded by a comma before a new keyword:
+        tokens = re.split(r",\s*(?=[a-zA-Z0-9_\-\s]+:)", line)
+        for tok in tokens:
+            tok = tok.strip()
+            if ":" in tok:
+                kw, resp = tok.split(":", 1)
+                kw_clean = kw.strip().lower()
+                resp_clean = resp.strip().rstrip(",")
+                if kw_clean and resp_clean:
+                    rules[kw_clean] = resp_clean
 
     return rules
 
@@ -368,6 +364,7 @@ class ConnectedAccount:
     first_name: str = ""
     can_reply: bool = True
     is_enabled: bool = True
+    keyword_triggers: bool = True
     trigger_all: bool = False
     custom_message: str = DEFAULT_CUSTOM_MESSAGE
     triggers_raw: str = DEFAULT_TRIGGERS_RAW
@@ -577,115 +574,117 @@ async def process_business_message(message: dict):
     )
 
     # -----------------------------------------------------------------------
-    # Step A: Predefined Trigger Containment Matching (.lower() optimized)
+    # Step A: Keyword Trigger / Conditions Mode (When keyword_triggers is ON)
     # -----------------------------------------------------------------------
-    text_lower = raw_text.lower()
-    matched_reply: Optional[str] = None
-    matched_keyword: Optional[str] = None
+    if account.keyword_triggers:
+        text_lower = raw_text.lower()
+        matched_reply: Optional[str] = None
+        matched_keyword: Optional[str] = None
 
-    for kw, reply_text in account.triggers.items():
-        if kw in text_lower:
-            matched_reply = reply_text
-            matched_keyword = kw
-            break
+        for kw, reply_text in account.triggers.items():
+            if kw and kw in text_lower:
+                matched_reply = reply_text
+                matched_keyword = kw
+                break
 
-    if matched_reply:
-        logger.info(
-            f"[Account @{account.username or account.user_id}] Trigger matched '{matched_keyword}'. Sending reply."
-        )
-        success = await send_business_message(
-            account.connection_id, chat_id, matched_reply
-        )
-        if success:
-            account.processed_count += 1
-            # Persist counter and message log asynchronously in MongoDB
-            asyncio.create_task(db_manager.increment_processed_count(account.user_id))
-            asyncio.create_task(
-                db_manager.log_interaction(
-                    account_id=account.user_id,
-                    customer_id=sender_id,
-                    customer_name=customer_name,
-                    incoming_text=raw_text,
-                    response_type="trigger",
-                    response_text=matched_reply,
-                    matched_keyword=matched_keyword,
-                )
+        if matched_reply:
+            logger.info(
+                f"[Account @{account.username or account.user_id}] Keyword condition matched '{matched_keyword}'. Sending specific reply."
             )
-        return
-
-    # -----------------------------------------------------------------------
-    # Step B: Trigger on All Messages Mode (Custom Auto-Reply Message)
-    # -----------------------------------------------------------------------
-    if account.trigger_all:
-        reply_content = account.custom_message or DEFAULT_CUSTOM_MESSAGE
-        logger.info(
-            f"[Account @{account.username or account.user_id}] Trigger-on-All activated. Sending customized reply."
-        )
-        success = await send_business_message(
-            account.connection_id, chat_id, reply_content
-        )
-        if success:
-            account.processed_count += 1
-            asyncio.create_task(db_manager.increment_processed_count(account.user_id))
-            asyncio.create_task(
-                db_manager.log_interaction(
-                    account_id=account.user_id,
-                    customer_id=sender_id,
-                    customer_name=customer_name,
-                    incoming_text=raw_text,
-                    response_type="trigger_all",
-                    response_text=reply_content,
-                    matched_keyword="[ALL_MESSAGES]",
-                )
-            )
-        return
-
-    # -----------------------------------------------------------------------
-    # Step C: AI Chatbot Fallback Mode via OpenRouter
-    # -----------------------------------------------------------------------
-    if account.ai_fallback:
-        if not OPENROUTER_API_KEY:
-            logger.warning(
-                f"[Account @{account.username or account.user_id}] AI Fallback requested, but OPENROUTER_API_KEY is not set."
-            )
-            return
-
-        logger.info(
-            f"[Account @{account.username or account.user_id}] No trigger matched. Initiating AI fallback (model: {account.model})."
-        )
-
-        # Native chat behavior alert: display 'typing...' feedback to sender
-        await send_typing_indicator(account.connection_id, chat_id)
-
-        ai_reply = await generate_openrouter_reply(raw_text, account.model)
-        if ai_reply:
             success = await send_business_message(
-                account.connection_id, chat_id, ai_reply
+                account.connection_id, chat_id, matched_reply
             )
             if success:
                 account.processed_count += 1
-                # Persist counter and message log asynchronously in MongoDB
-                asyncio.create_task(
-                    db_manager.increment_processed_count(account.user_id)
-                )
+                asyncio.create_task(db_manager.increment_processed_count(account.user_id))
                 asyncio.create_task(
                     db_manager.log_interaction(
                         account_id=account.user_id,
                         customer_id=sender_id,
                         customer_name=customer_name,
                         incoming_text=raw_text,
-                        response_type="ai_fallback",
-                        response_text=ai_reply,
-                        ai_model=account.model,
+                        response_type="keyword_trigger",
+                        response_text=matched_reply,
+                        matched_keyword=matched_keyword,
                     )
                 )
-                logger.info(
-                    f"[Account @{account.username or account.user_id}] AI reply delivered to sender {sender_id}."
+            return
+
+        # If keyword_triggers is ON, but no keyword matched:
+        # Check if AI Fallback is enabled
+        if account.ai_fallback:
+            if not OPENROUTER_API_KEY:
+                logger.warning(
+                    f"[Account @{account.username or account.user_id}] AI Fallback requested, but OPENROUTER_API_KEY is not set."
                 )
-        else:
-            logger.warning(
-                f"[Account @{account.username or account.user_id}] AI generation returned empty content."
+                return
+
+            logger.info(
+                f"[Account @{account.username or account.user_id}] No keyword condition matched. Initiating AI fallback (model: {account.model})."
             )
+            await send_typing_indicator(account.connection_id, chat_id)
+            ai_reply = await generate_openrouter_reply(raw_text, account.model)
+            if ai_reply:
+                success = await send_business_message(
+                    account.connection_id, chat_id, ai_reply
+                )
+                if success:
+                    account.processed_count += 1
+                    asyncio.create_task(
+                        db_manager.increment_processed_count(account.user_id)
+                    )
+                    asyncio.create_task(
+                        db_manager.log_interaction(
+                            account_id=account.user_id,
+                            customer_id=sender_id,
+                            customer_name=customer_name,
+                            incoming_text=raw_text,
+                            response_type="ai_fallback",
+                            response_text=ai_reply,
+                            ai_model=account.model,
+                        )
+                    )
+                    logger.info(
+                        f"[Account @{account.username or account.user_id}] AI reply delivered to sender {sender_id}."
+                    )
+            else:
+                logger.warning(
+                    f"[Account @{account.username or account.user_id}] AI generation returned empty content."
+                )
+            return
+
+        # If keyword_triggers is ON and no keyword matched and AI is OFF -> do not reply
+        logger.info(
+            f"[Account @{account.username or account.user_id}] Keyword Trigger is ON, but incoming DM did not match any keyword conditions. Ignored."
+        )
+        return
+
+    # -----------------------------------------------------------------------
+    # Step B: Keyword Trigger is OFF -> Reply to ALL Messages Mode
+    # -----------------------------------------------------------------------
+    # "if off then it will reply on all keywords (no matter what that keyword)"
+    reply_content = account.custom_message or DEFAULT_CUSTOM_MESSAGE
+    logger.info(
+        f"[Account @{account.username or account.user_id}] Keyword Trigger is OFF. Replying to message with Customized Auto-Reply Message."
+    )
+    success = await send_business_message(
+        account.connection_id, chat_id, reply_content
+    )
+    if success:
+        account.processed_count += 1
+        asyncio.create_task(db_manager.increment_processed_count(account.user_id))
+        asyncio.create_task(
+            db_manager.log_interaction(
+                account_id=account.user_id,
+                customer_id=sender_id,
+                customer_name=customer_name,
+                incoming_text=raw_text,
+                response_type="all_messages_custom",
+                response_text=reply_content,
+                matched_keyword="[ALL_MESSAGES]",
+            )
+        )
+    return
 
 
 # ---------------------------------------------------------------------------
@@ -834,17 +833,24 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
         else acc.custom_message
     )
 
+    if acc.keyword_triggers:
+        mode_str = "🔑 KEYWORD CONDITIONS (Specific replies per keyword)"
+        kw_btn_text = "🔑 Keywords: ON"
+    else:
+        mode_str = "💬 REPLY TO ALL (Custom reply for all messages)"
+        kw_btn_text = "💬 Keywords: OFF (Reply All)"
+
     text = (
         f"<b>SETTINGS</b>\n"
         f"<b>Account:</b> @{html.escape(acc.username or str(acc.user_id))} ({html.escape(acc.first_name)})\n\n"
         f"• <b>Status:</b> {status_text}\n"
         f"• <b>Owner Presence:</b> {presence_str}\n"
         f"• <b>Smart Away Mode:</b> {away_status}\n"
-        f"• <b>Trigger on All Msgs:</b> {trig_all_status}\n"
+        f"• <b>Active Mode:</b> {mode_str}\n"
         f"• <b>Custom Message:</b> <i>{html.escape(custom_snippet)}</i>\n"
         f"• <b>AI Fallback:</b> {ai_status}\n"
         f"• <b>AI Model:</b> <code>{html.escape(acc.model)}</code>\n"
-        f"• <b>Predefined Triggers:</b> {triggers_count} active rule(s)\n"
+        f"• <b>Keyword Conditions:</b> {triggers_count} active rule(s)\n"
         f"• <b>DMs Auto-Responded:</b> {acc.processed_count}\n\n"
         f"<i>Select one of the settings that you want to change:</i>"
     )
@@ -852,7 +858,6 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
     ai_btn_text = "🤖 AI Fallback: ON" if acc.ai_fallback else "🤖 AI Fallback: OFF"
     active_btn_text = "⚡ Status: ACTIVE" if acc.active else "⚡ Status: PAUSED"
     away_btn_text = "🌙 Away Mode: ON" if acc.away_mode else "🌙 Away Mode: OFF"
-    trig_all_btn_text = "🎯 Trigger All: ON" if acc.trigger_all else "🎯 Trigger All: OFF"
 
     keyboard = [
         [
@@ -867,8 +872,8 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
             },
         ],
         [
-            {"text": trig_all_btn_text, "callback_data": f"tog_trig_all_{acc.user_id}"},
-            {"text": "💬 Customize Message", "callback_data": f"cust_msg_menu_{acc.user_id}"},
+            {"text": kw_btn_text, "callback_data": f"tog_kw_{acc.user_id}"},
+            {"text": "💬 Custom Message", "callback_data": f"cust_msg_menu_{acc.user_id}"},
         ],
         [
             {"text": "📝 View Triggers", "callback_data": f"view_trig_{acc.user_id}"},
@@ -1055,18 +1060,19 @@ async def handle_callback_query(cq: dict):
             await edit(text, kb)
         return
 
-    # Toggle Trigger All Messages Mode
-    if data.startswith("tog_trig_all_"):
-        uid = int(data.split("_")[3])
+    # Toggle Keyword Triggers Mode / Reply All Mode
+    if data.startswith(("tog_kw_", "tog_trig_all_")):
+        parts = data.split("_")
+        uid = int(parts[-1])
         acc = accounts.get(uid)
         if acc:
-            acc.trigger_all = not acc.trigger_all
+            acc.keyword_triggers = not acc.keyword_triggers
+            acc.trigger_all = not acc.keyword_triggers
             await db_manager.save_account(acc)
-            status_msg = (
-                "🎯 Trigger on All Messages ENABLED: Bot will automatically reply to every incoming DM with your customized message."
-                if acc.trigger_all
-                else "🎯 Trigger on All Messages DISABLED: Bot will only reply when a keyword trigger matches."
-            )
+            if acc.keyword_triggers:
+                status_msg = "🔑 Keyword Conditions Mode ON: Bot will check different keywords for different replies."
+            else:
+                status_msg = "💬 Reply to All Mode ON: Bot will reply to ALL incoming messages with your custom message (regardless of keyword)."
             await answer(status_msg, alert=True)
             text, kb = build_account_settings_menu(acc)
             await edit(text, kb)
@@ -1528,6 +1534,10 @@ async def lifespan(app: FastAPI):
     persisted_accounts = await db_manager.load_all_accounts()
     for doc in persisted_accounts:
         uid = doc["_id"]
+        kw_trig = doc.get("keyword_triggers")
+        if kw_trig is None:
+            kw_trig = not doc.get("trigger_all", False)
+
         acc = ConnectedAccount(
             connection_id=doc.get("connection_id", ""),
             user_id=uid,
@@ -1535,7 +1545,8 @@ async def lifespan(app: FastAPI):
             first_name=doc.get("first_name", ""),
             can_reply=doc.get("can_reply", True),
             is_enabled=doc.get("is_enabled", True),
-            trigger_all=doc.get("trigger_all", False),
+            keyword_triggers=kw_trig,
+            trigger_all=not kw_trig,
             custom_message=doc.get("custom_message", DEFAULT_CUSTOM_MESSAGE),
             triggers_raw=doc.get("triggers_raw", DEFAULT_TRIGGERS_RAW),
             triggers=doc.get("triggers") or parse_triggers(DEFAULT_TRIGGERS_RAW),
@@ -1665,7 +1676,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
 
             ai_checked = "checked" if acc.ai_fallback else ""
             away_checked = "checked" if acc.away_mode else ""
-            trig_all_checked = "checked" if acc.trigger_all else ""
+            kw_checked = "checked" if acc.keyword_triggers else ""
             user_title = (
                 f"@{html.escape(acc.username)}"
                 if acc.username
@@ -1683,6 +1694,11 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 else:
                     presence_pill = f"Presence: <strong style='color:#94a3b8;'>Away ({int(idle_s / 60)}m ago)</strong>"
 
+            if acc.keyword_triggers:
+                mode_pill = '<span class="stat-pill" style="border-color: rgba(74, 222, 128, 0.4); color: #4ade80;">Mode: <strong>Keywords (Conditions)</strong></span>'
+            else:
+                mode_pill = '<span class="stat-pill" style="border-color: rgba(56, 189, 248, 0.4); color: #38bdf8;">Mode: <strong>Reply on All Msgs</strong></span>'
+
             cards_html += f"""
             <div class="card account-card">
                 <div class="card-header">
@@ -1699,35 +1715,36 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 <div class="stat-pill-row">
                     <span class="stat-pill">DMs Auto-Responded: <strong>{acc.processed_count}</strong></span>
                     <span class="stat-pill">{presence_pill}</span>
-                    <span class="stat-pill">Status: <strong>{'Enabled' if acc.is_enabled else 'Disconnected'}</strong></span>
+                    {mode_pill}
                 </div>
 
                 <form method="POST" action="/account/{user_id}/update" class="account-form">
                     <div class="form-group">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                            <label style="margin-bottom:0; font-weight: 600; color: var(--accent-blue);">💬 Customized Auto-Reply Message (Text + Links)</label>
+                            <label style="margin-bottom:0; font-weight: 600; color: var(--accent-blue);">💬 Customized Message (Reply to All Mode)</label>
                             <span style="font-size: 11px; color: var(--text-muted);">Rich https://t.me/ previews</span>
                         </div>
-                        <textarea name="custom_message" rows="5" class="form-control" style="min-height: 120px; font-size: 13px; line-height: 1.45;" placeholder="Enter custom auto-reply or invite links (e.g. Join our group: https://t.me/+...). Telegram will render the preview card automatically!">{html.escape(acc.custom_message)}</textarea>
-                        <div class="form-help">👉 Enter plain text and/or channel/group links (e.g. <code>https://t.me/+...</code>). Telegram renders the photo, description, and "View Group" button automatically.</div>
+                        <textarea name="custom_message" rows="5" class="form-control" style="min-height: 120px; font-size: 13px; line-height: 1.45;" placeholder="Enter custom message or invite links (e.g. Join our group: https://t.me/+...). Sent to all messages when Keyword Trigger is OFF!">{html.escape(acc.custom_message)}</textarea>
+                        <div class="form-help">👉 <strong>Reply on All Mode:</strong> When Keyword Trigger is OFF, this message is sent to all incoming DMs (no matter what keyword). Supports rich Telegram cards for links.</div>
                     </div>
 
                     <div class="form-group">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                            <label style="margin-bottom:0; font-weight: 600;">📝 Predefined Triggers (keyword:response)</label>
-                            <span style="font-size: 11px; color: var(--text-muted);">Comma or newline separated</span>
+                            <label style="margin-bottom:0; font-weight: 600;">📝 Keyword Conditions & Replies (When Keyword Trigger is ON)</label>
+                            <span style="font-size: 11px; color: var(--text-muted);">keyword:response (1 per line)</span>
                         </div>
-                        <textarea name="triggers" rows="5" class="form-control" style="min-height: 120px; font-size: 13px; font-family: monospace; line-height: 1.45;" placeholder="keyword:response text, ...">{html.escape(acc.triggers_raw)}</textarea>
+                        <textarea name="triggers" rows="5" class="form-control" style="min-height: 120px; font-size: 13px; font-family: monospace; line-height: 1.45;" placeholder="hello:Hello there!, pricing:Our plans start at $19/mo, group:Join here https://t.me/+...">{html.escape(acc.triggers_raw)}</textarea>
+                        <div class="form-help">👉 <strong>Keyword Conditions Mode:</strong> When Keyword Trigger is ON, matches different keywords for different replies (with rich preview cards). If no keyword matches, bot stays quiet.</div>
                     </div>
 
                     <div class="form-row" style="flex-wrap: wrap; margin-bottom: 16px;">
-                        <div class="form-group toggle-group" style="flex: 1; min-width: 105px;">
-                            <label>Trigger All</label>
+                        <div class="form-group toggle-group" style="flex: 1; min-width: 115px;">
+                            <label>Keyword Trigger</label>
                             <label class="switch">
-                                <input type="checkbox" name="trigger_all" value="on" {trig_all_checked}>
+                                <input type="checkbox" name="keyword_triggers" value="on" {kw_checked}>
                                 <span class="slider"></span>
                             </label>
-                            <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Auto-reply all</span>
+                            <span style="font-size: 10px; color: {'#4ade80' if acc.keyword_triggers else '#38bdf8'}; margin-top: 3px;">{'ON = Conditions' if acc.keyword_triggers else 'OFF = Reply All'}</span>
                         </div>
                         <div class="form-group toggle-group" style="flex: 1; min-width: 95px;">
                             <label>Smart Away</label>
@@ -2246,21 +2263,21 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
             </div>
             <form method="POST" action="/bulk-update">
                 <div class="form-group">
-                    <label style="font-weight: 600; color: var(--accent-blue);">💬 Bulk Custom Auto-Reply Message (with link preview support for https://t.me/...)</label>
+                    <label style="font-weight: 600; color: var(--accent-blue);">💬 Bulk Custom Message (Sent to all DMs when Keyword Trigger is OFF)</label>
                     <textarea name="custom_message" rows="4" class="form-control" style="min-height: 100px;" placeholder="Hello! Join our group: https://t.me/+...">{html.escape(bulk_custom_msg)}</textarea>
                 </div>
                 <div class="form-group">
-                    <label style="font-weight: 600;">📝 Bulk Trigger Rules (keyword:response text, separated by commas or newlines)</label>
-                    <textarea name="triggers" rows="4" class="form-control" style="min-height: 100px;" placeholder="hello:Hi there!, pricing:Our pricing is $10/mo">{html.escape(bulk_triggers)}</textarea>
+                    <label style="font-weight: 600;">📝 Bulk Keyword Conditions (keyword:response text, 1 per line)</label>
+                    <textarea name="triggers" rows="4" class="form-control" style="min-height: 100px;" placeholder="hello:Hi there!, pricing:Our pricing is $10/mo, group:https://t.me/+...">{html.escape(bulk_triggers)}</textarea>
                 </div>
                 <div class="form-row" style="flex-wrap: wrap; margin-bottom: 16px;">
-                    <div class="form-group toggle-group" style="flex: 1; min-width: 105px;">
-                        <label>Trigger All</label>
+                    <div class="form-group toggle-group" style="flex: 1; min-width: 115px;">
+                        <label>Keyword Trigger</label>
                         <label class="switch">
-                            <input type="checkbox" name="trigger_all" value="on">
+                            <input type="checkbox" name="keyword_triggers" value="on" checked>
                             <span class="slider"></span>
                         </label>
-                        <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Auto-reply all</span>
+                        <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">ON=Rules, OFF=All</span>
                     </div>
                     <div class="form-group toggle-group" style="flex: 1; min-width: 95px;">
                         <label>Smart Away</label>
@@ -2367,7 +2384,8 @@ async def health_check():
             "connected_accounts": len(accounts),
             "active_auto_responders": active_count,
             "away_mode_active": sum(1 for a in accounts.values() if a.away_mode),
-            "trigger_all_active": sum(1 for a in accounts.values() if a.trigger_all),
+            "keyword_triggers_active": sum(1 for a in accounts.values() if a.keyword_triggers),
+            "reply_all_active": sum(1 for a in accounts.values() if not a.keyword_triggers),
             "total_triggers_configured": total_triggers,
             "openrouter_status": "READY" if OPENROUTER_API_KEY else "NOT_CONFIGURED",
         },
@@ -2394,7 +2412,8 @@ async def bulk_update_accounts(request: Request):
         data.get("custom_message", [DEFAULT_CUSTOM_MESSAGE])[0].strip()
         or DEFAULT_CUSTOM_MESSAGE
     )
-    trigger_all = "trigger_all" in data
+    keyword_triggers = "keyword_triggers" in data
+    trigger_all = not keyword_triggers
     ai_fallback = "ai_fallback" in data
     away_mode = "away_mode" in data
     model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
@@ -2404,6 +2423,7 @@ async def bulk_update_accounts(request: Request):
         acc.triggers_raw = triggers_raw
         acc.triggers = parsed_rules
         acc.custom_message = custom_message
+        acc.keyword_triggers = keyword_triggers
         acc.trigger_all = trigger_all
         acc.ai_fallback = ai_fallback
         acc.away_mode = away_mode
@@ -2412,7 +2432,7 @@ async def bulk_update_accounts(request: Request):
         await db_manager.save_account(acc)
 
     logger.info(
-        f"Bulk update executed: applied {len(parsed_rules)} triggers, trigger_all={trigger_all}, AI fallback={ai_fallback}, model='{model}' across {len(accounts)} accounts."
+        f"Bulk update executed: applied {len(parsed_rules)} triggers, keyword_triggers={keyword_triggers}, AI fallback={ai_fallback}, model='{model}' across {len(accounts)} accounts."
     )
     return RedirectResponse(
         url="/?msg=All+connected+accounts+synchronized+successfully", status_code=303
@@ -2439,7 +2459,8 @@ async def update_account_config(user_id: int, request: Request):
         data.get("custom_message", [DEFAULT_CUSTOM_MESSAGE])[0].strip()
         or DEFAULT_CUSTOM_MESSAGE
     )
-    acc.trigger_all = "trigger_all" in data
+    acc.keyword_triggers = "keyword_triggers" in data
+    acc.trigger_all = not acc.keyword_triggers
     acc.ai_fallback = "ai_fallback" in data
     acc.away_mode = "away_mode" in data
     acc.model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
@@ -2448,7 +2469,7 @@ async def update_account_config(user_id: int, request: Request):
     await db_manager.save_account(acc)
 
     logger.info(
-        f"[Account @{acc.username or user_id}] Updated: trigger_all={acc.trigger_all}, {len(acc.triggers)} triggers, AI fallback={acc.ai_fallback}, model='{acc.model}'"
+        f"[Account @{acc.username or user_id}] Updated: keyword_triggers={acc.keyword_triggers}, {len(acc.triggers)} triggers, AI fallback={acc.ai_fallback}, model='{acc.model}'"
     )
     return RedirectResponse(
         url=f"/?msg=Settings+and+messages+saved+successfully+for+@{html.escape(acc.username or str(user_id))}",

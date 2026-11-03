@@ -13,10 +13,10 @@ Runs seamlessly on the **Render Free Tier** (0.1 vCPU, 500MB RAM) with an ultra-
 1. **Multi-Account Concurrency via Telegram Business**:
    - Single `@BotFather` bot handles unlimited connected personal Telegram accounts.
    - Each account has completely isolated settings, trigger rules, custom auto-reply messages, AI fallback choices, and message counters.
-2. **Trigger on All Messages & Custom Replies**:
-   - Auto-reply to **EVERY** incoming private DM with a fully personalized response.
-   - **Rich Link Preview Cards**: If you include Telegram channel or group invite links (e.g. `https://t.me/+...`), Telegram automatically renders the full rich card with group photo, title, member preview, and "View Group" join button (matching native Telegram previews)!
-   - Toggleable directly in the Telegram DM wizard (`[🎯 Trigger All: ON/OFF]`) or web dashboard.
+2. **Keyword Conditions vs Reply to All Dual Mode**:
+   - **Keyword Trigger ON**: Checks conditions (different keywords ➔ different replies). When an incoming DM contains a configured keyword (e.g. `pricing`, `help`, `link`), it sends that keyword's specific reply (with rich preview cards for links). Non-matching DMs are ignored cleanly.
+   - **Keyword Trigger OFF**: Replies to **ALL incoming DMs** with the **Customized Auto-Reply Message** (with rich link previews for `https://t.me/...`), no matter what keyword or text the sender typed!
+   - Toggleable directly in the Telegram DM wizard (`[🔑 Keywords: ON/OFF]`) or the Web Dashboard.
 3. **Smart Away Mode (Auto-Offline Detection)**:
    - When the user is **actively chatting** on their Telegram account, the bot automatically **deactivates** so it never speaks over the human.
    - When the user goes **offline / idle** (e.g. no messages sent for > 5 minutes), the bot automatically **activates** and manages all incoming DMs!
