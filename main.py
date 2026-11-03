@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import html
 import logging
 import os
+import re
 import sys
 import urllib.parse
 from contextlib import asynccontextmanager
@@ -20,6 +21,12 @@ import motor.motor_asyncio
 import uvicorn
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+# Pre-compiled high-performance regular expressions
+LINK_NORMALIZE_REGEX = re.compile(
+    r"(?<!https://)(?<!http://)\b((?:t|telegram)\.me/[^\s]+)"
+)
+RULE_SPLIT_REGEX = re.compile(r",\s*(?=[a-zA-Z0-9_\-\s]+:)")
 
 # ---------------------------------------------------------------------------
 # Logging Configuration
@@ -327,8 +334,6 @@ def parse_triggers(raw: str) -> Dict[str, str]:
     Format: 'keyword:response text'
     Handles colons inside URLs (e.g. https://...) and commas inside replies safely.
     """
-    import re
-
     rules: Dict[str, str] = {}
     if not raw:
         return rules
@@ -340,7 +345,7 @@ def parse_triggers(raw: str) -> Dict[str, str]:
             continue
 
         # Split multiple rules on the same line only if preceded by a comma before a new keyword:
-        tokens = re.split(r",\s*(?=[a-zA-Z0-9_\-\s]+:)", line)
+        tokens = RULE_SPLIT_REGEX.split(line)
         for tok in tokens:
             tok = tok.strip()
             if ":" in tok:
@@ -428,8 +433,7 @@ def normalize_links_for_preview(text: str) -> str:
     Ensures standalone 't.me/...' or 'telegram.me/...' links have 'https://' prefix
     so Telegram Bot API reliably renders the rich preview card.
     """
-    import re
-    return re.sub(r'(?<!https://)(?<!http://)\b((?:t|telegram)\.me/[^\s]+)', r'https://\1', text)
+    return LINK_NORMALIZE_REGEX.sub(r"https://\1", text)
 
 
 async def send_business_message(
@@ -1391,6 +1395,10 @@ async def run_bot_polling():
                     from_user = msg.get("from", {})
                     from_user_id = from_user.get("id")
                     text = (msg.get("text") or "").strip()
+
+                    # If user sends a command, cancel any pending wizard input state
+                    if text.startswith("/"):
+                        user_wizard_state.pop(from_user_id, None)
 
                     # Handle Wizard Text Input (e.g. adding a trigger rule or editing custom message)
                     if from_user_id in user_wizard_state:
