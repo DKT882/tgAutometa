@@ -63,8 +63,8 @@ Send `/settings` to the bot in a private chat to access the wizard:
 │                                               │
 │ [ ✅ 👤 @alice (14 DMs)                     ] │
 │ [ ⏸️ 👤 @bob (5 DMs)                        ] │
-│ [ 🔄 Refresh List  ] [ ⚡ Bulk Sync All      ] │
-│ [ 📊 System Stats  ] [ ❌ Close Menu         ] │
+│ [ 🔄 Refresh List  ] [ 📊 System Stats       ] │
+│ [ ❌ Close Menu                              ] │
 └───────────────────────────────────────────────┘
                         │
                         ▼ (Tap an account)

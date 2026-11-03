@@ -962,7 +962,8 @@ def build_accounts_menu() -> tuple[str, list]:
         "If an account doesn't appear here:\n"
         "• Open Telegram <b>Settings</b> ➔ <b>Telegram Business</b> ➔ <b>Chatbots</b>\n"
         f"• Add @{bot_info.get('username')} and enable <b>'Reply to messages'</b>\n"
-        "• Press <b>'🔄 Refresh List'</b> below."
+        "• Press <b>'🔄 Refresh List'</b> below.\n\n"
+        "🌐 <i>Tip: Bulk synchronization across all accounts is configured on your Web GUI Dashboard.</i>"
     )
 
     keyboard = []
@@ -991,12 +992,11 @@ def build_accounts_menu() -> tuple[str, list]:
     keyboard.append(
         [
             {"text": "🔄 Refresh List", "callback_data": "refresh_list"},
-            {"text": "⚡ Bulk Sync All", "callback_data": "bulk_sync_menu"},
+            {"text": "📊 System Stats", "callback_data": "sys_stats"},
         ]
     )
     keyboard.append(
         [
-            {"text": "📊 System Stats", "callback_data": "sys_stats"},
             {"text": "❌ Close Menu", "callback_data": "close_menu"},
         ]
     )
@@ -1222,40 +1222,11 @@ async def handle_callback_query(cq: dict):
         await answer()
         return
 
-    if data == "bulk_sync_menu":
-        confirm_text = (
-            "<b>⚡ Bulk Synchronization Tool</b>\n\n"
-            "This action will overwrite keyword triggers, response bubbles, AI fallback toggle, "
-            "and default AI models across <b>ALL</b> connected accounts simultaneously.\n\n"
-            "Do you want to proceed?"
+    if data in ("bulk_sync_menu", "confirm_bulk_sync"):
+        await answer(
+            "⚡ Bulk synchronization is now exclusively managed from your Web GUI Dashboard.",
+            alert=True,
         )
-        kb = [
-            [
-                {
-                    "text": "✅ Yes, Sync All Accounts",
-                    "callback_data": "confirm_bulk_sync",
-                }
-            ],
-            [{"text": "⬅️ Cancel", "callback_data": "back_to_accounts"}],
-        ]
-        await edit(confirm_text, kb)
-        await answer()
-        return
-
-    if data == "confirm_bulk_sync":
-        default_parsed = parse_triggers(DEFAULT_TRIGGERS_RAW)
-        for acc in accounts.values():
-            acc.triggers_raw = DEFAULT_TRIGGERS_RAW
-            acc.triggers = default_parsed
-            acc.custom_message = DEFAULT_CUSTOM_MESSAGE
-            acc.custom_messages = [DEFAULT_CUSTOM_MESSAGE]
-            acc.quote_reply = True
-            acc.ai_fallback = True
-            acc.model = DEFAULT_MODEL
-            await db_manager.save_account(acc)
-        await answer("All accounts synchronized successfully!", alert=True)
-        text, kb = build_accounts_menu()
-        await edit(text, kb)
         return
 
     # Account Specific Routes
@@ -2777,13 +2748,16 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                     <span>OpenRouter:</span>
                     <span class="stat-value" style="color: {'#4ade80' if OPENROUTER_API_KEY else '#fbbf24'}">{'Ready' if OPENROUTER_API_KEY else 'API Key Missing'}</span>
                 </div>
+                <a href="#bulk-sync" class="stat-chip" style="text-decoration: none; border-color: rgba(59, 130, 246, 0.5); background: rgba(59, 130, 246, 0.12); cursor: pointer;">
+                    <span style="color: #60a5fa; font-weight: 600;">⚡ Bulk Sync Tool</span>
+                </a>
             </div>
         </header>
 
         {banner_html}
 
-        <!-- Persistent Bulk Update & Multi-Sync Tool -->
-        <div class="bulk-card">
+        <!-- Persistent Bulk Update & Multi-Sync Tool (Exclusively on GUI Dashboard) -->
+        <div class="bulk-card" id="bulk-sync">
             <div class="bulk-header">
                 <div class="bulk-title">
                     <span>⚡ Bulk Update & Multi-Sync Tool</span>
@@ -2793,7 +2767,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 </span>
             </div>
             <div class="bulk-desc">
-                Overwrite trigger keywords, response bubbles, and settings across ALL connected accounts in a single click.
+                Overwrite trigger keywords, response bubbles, and settings across ALL connected accounts in a single click. (Managed exclusively via this GUI Dashboard)
             </div>
             <form method="POST" action="/bulk-update">
                 <div class="form-group">
