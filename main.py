@@ -27,6 +27,7 @@ LINK_NORMALIZE_REGEX = re.compile(
     r"(?<!https://)(?<!http://)\b((?:t|telegram)\.me/[^\s]+)"
 )
 RULE_SPLIT_REGEX = re.compile(r",\s*(?=[a-zA-Z0-9_\-\s]+:)")
+BUBBLE_SPLIT_REGEX = re.compile(r"(?:\r?\n)?\s*(?:---|===)\s*(?:\r?\n)?")
 
 # ---------------------------------------------------------------------------
 # Logging Configuration
@@ -81,253 +82,24 @@ DEFAULT_CUSTOM_MESSAGE = (
 ).strip()
 
 # User session state for interactive Telegram DM Wizard
-# e.g., {user_id: {"action": "awaiting_trigger", "target_account_id": 123456}}
 user_wizard_state: Dict[int, Dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
-# Database Layer (MongoDB via Motor async driver)
+# Rule & Bubble Parsing Utilities
 # ---------------------------------------------------------------------------
-class DatabaseManager:
+def split_message_bubbles(content: str) -> List[str]:
     """
-    Manages non-blocking async persistence with MongoDB.
-    Maintains collections for accounts, audit message logs, and global settings.
+    Splits message content into discrete response bubbles.
+    Supports '---' or '===' delimiter or newline separation.
     """
-
-    def __init__(self):
-        self.client: Optional[motor.motor_asyncio.AsyncIOMotorClient] = None
-        self.db = None
-        self.accounts_col = None
-        self.logs_col = None
-        self.settings_col = None
-        self.connected = False
-
-    async def connect(self):
-        if not MONGO_URI:
-            logger.warning(
-                "MONGO_URI not configured. Operating in in-memory mode with volatile persistence."
-            )
-            return
-
-        # Check for unreplaced placeholder template strings in MONGO_URI
-        if any(
-            p in MONGO_URI
-            for p in ["<password>", "<db_password>", "username:password", "<username>"]
-        ):
-            logger.error(
-                "[DB] MONGO_URI contains unreplaced placeholder text (like '<password>' or 'username:password'). "
-                "Please replace it with your actual MongoDB Atlas database username and password in Render Environment Variables. "
-                "Operating in in-memory mode safely."
-            )
-            return
-
-        try:
-            logger.info("Connecting to MongoDB cluster...")
-            self.client = motor.motor_asyncio.AsyncIOMotorClient(
-                MONGO_URI,
-                serverSelectionTimeoutMS=4000,
-                connectTimeoutMS=4000,
-                maxPoolSize=20,
-                minPoolSize=1,
-            )
-            # Ping database to verify connection
-            await self.client.admin.command("ping")
-            self.db = self.client[MONGO_DB_NAME]
-            self.accounts_col = self.db["accounts"]
-            self.logs_col = self.db["message_logs"]
-            self.settings_col = self.db["bot_settings"]
-
-            # Initialize database indexes
-            await self.accounts_col.create_index("connection_id", sparse=True)
-            await self.accounts_col.create_index("username")
-            await self.logs_col.create_index([("account_id", 1), ("timestamp", -1)])
-            await self.logs_col.create_index("timestamp")
-
-            self.connected = True
-            logger.info(
-                f"[DB] Successfully connected to MongoDB database '{MONGO_DB_NAME}'. Indexes verified."
-            )
-        except Exception as exc:
-            self.connected = False
-            if self.client:
-                try:
-                    self.client.close()
-                except Exception:
-                    pass
-                self.client = None
-            self.db = None
-            err_msg = str(exc)
-            if (
-                "Authentication failed" in err_msg
-                or "bad auth" in err_msg
-                or "code 8000" in err_msg
-            ):
-                logger.error(
-                    "[DB] MongoDB Authentication Failed (bad auth): The username or password in MONGO_URI is incorrect. "
-                    "Please verify your Database User credentials in MongoDB Atlas (Security -> Database Access). "
-                    "Falling back to in-memory mode safely."
-                )
-            else:
-                logger.error(
-                    f"[DB] Failed to connect to MongoDB ({err_msg}). Falling back to in-memory mode.",
-                    exc_info=False,
-                )
-
-    async def close(self):
-        if self.client:
-            self.client.close()
-            logger.info("[DB] MongoDB client connection pool closed.")
-
-    async def load_all_accounts(self) -> List[dict]:
-        if not self.connected or self.accounts_col is None:
-            return []
-        try:
-            cursor = self.accounts_col.find({})
-            return await cursor.to_list(length=100)
-        except Exception as exc:
-            logger.error(f"[DB] Error loading accounts from MongoDB: {exc}")
-            return []
-
-    async def save_account(self, account: "ConnectedAccount"):
-        if not self.connected or self.accounts_col is None:
-            return
-        try:
-            doc = {
-                "_id": account.user_id,
-                "user_id": account.user_id,
-                "connection_id": account.connection_id,
-                "username": account.username,
-                "first_name": account.first_name,
-                "can_reply": account.can_reply,
-                "is_enabled": account.is_enabled,
-                "active": account.active,
-                "away_mode": account.away_mode,
-                "away_timeout_minutes": account.away_timeout_minutes,
-                "last_owner_activity": account.last_owner_activity,
-                "keyword_triggers": account.keyword_triggers,
-                "trigger_all": account.trigger_all,
-                "custom_message": account.custom_message,
-                "triggers_raw": account.triggers_raw,
-                "triggers": account.triggers,
-                "ai_fallback": account.ai_fallback,
-                "model": account.model,
-                "processed_count": account.processed_count,
-                "updated_at": datetime.now(timezone.utc),
-            }
-            await self.accounts_col.update_one(
-                {"_id": account.user_id},
-                {"$set": doc, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
-                upsert=True,
-            )
-        except Exception as exc:
-            logger.error(f"[DB] Failed to save account {account.user_id}: {exc}")
-
-    async def increment_processed_count(self, user_id: int):
-        if not self.connected or self.accounts_col is None:
-            return
-        try:
-            await self.accounts_col.update_one(
-                {"_id": user_id},
-                {
-                    "$inc": {"processed_count": 1},
-                    "$set": {"updated_at": datetime.now(timezone.utc)},
-                },
-            )
-        except Exception as exc:
-            logger.error(f"[DB] Failed to increment count for user {user_id}: {exc}")
-
-    async def log_interaction(
-        self,
-        account_id: int,
-        customer_id: int,
-        customer_name: str,
-        incoming_text: str,
-        response_type: str,
-        response_text: str,
-        matched_keyword: Optional[str] = None,
-        ai_model: Optional[str] = None,
-    ):
-        if not self.connected or self.logs_col is None:
-            return
-        try:
-            log_doc = {
-                "account_id": account_id,
-                "customer_id": customer_id,
-                "customer_name": customer_name,
-                "incoming_text": incoming_text[:500],
-                "response_type": response_type,
-                "matched_keyword": matched_keyword,
-                "ai_model": ai_model,
-                "response_text": response_text[:1000],
-                "timestamp": datetime.now(timezone.utc),
-            }
-            await self.logs_col.insert_one(log_doc)
-        except Exception as exc:
-            logger.error(f"[DB] Failed to record message audit log: {exc}")
-
-    async def get_account_stats(self, account_id: int) -> dict:
-        if not self.connected or self.logs_col is None:
-            return {"total": 0, "triggers": 0, "ai": 0}
-        try:
-            total = await self.logs_col.count_documents({"account_id": account_id})
-            triggers = await self.logs_col.count_documents(
-                {"account_id": account_id, "response_type": "trigger"}
-            )
-            ai = await self.logs_col.count_documents(
-                {"account_id": account_id, "response_type": "ai_fallback"}
-            )
-            return {"total": total, "triggers": triggers, "ai": ai}
-        except Exception:
-            return {"total": 0, "triggers": 0, "ai": 0}
-
-    async def get_health_metrics(self) -> dict:
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
-        if not self.connected or self.client is None or self.db is None:
-            triggers_sum = sum(a.processed_count for a in accounts.values())
-            return {
-                "connected": False,
-                "accounts_saved": len(accounts),
-                "messages_logged": 0,
-                "triggers_matched": triggers_sum,
-                "ai_fallbacks_generated": 0,
-                "last_heartbeat": now_str,
-            }
-        try:
-            await self.client.admin.command("ping")
-            accounts_count = await self.accounts_col.count_documents({})
-            messages_count = await self.logs_col.count_documents({})
-            triggers_count = await self.logs_col.count_documents(
-                {"response_type": "trigger"}
-            )
-            ai_count = await self.logs_col.count_documents(
-                {"response_type": "ai_fallback"}
-            )
-            return {
-                "connected": True,
-                "accounts_saved": accounts_count,
-                "messages_logged": messages_count,
-                "triggers_matched": triggers_count,
-                "ai_fallbacks_generated": ai_count,
-                "last_heartbeat": now_str,
-            }
-        except Exception as exc:
-            logger.error(f"[DB] Health heartbeat ping failed: {exc}")
-            return {
-                "connected": False,
-                "accounts_saved": len(accounts),
-                "messages_logged": 0,
-                "triggers_matched": 0,
-                "ai_fallbacks_generated": 0,
-                "last_heartbeat": now_str,
-            }
+    if not content:
+        return []
+    parts = BUBBLE_SPLIT_REGEX.split(content)
+    bubbles = [p.strip() for p in parts if p.strip()]
+    return bubbles if bubbles else [content.strip()]
 
 
-db_manager = DatabaseManager()
-
-
-# ---------------------------------------------------------------------------
-# Rule Parsing Utilities
-# ---------------------------------------------------------------------------
 def parse_triggers(raw: str) -> Dict[str, str]:
     """
     Parse comma-separated or newline-separated trigger strings into a dictionary.
@@ -371,23 +143,393 @@ class ConnectedAccount:
     is_enabled: bool = True
     keyword_triggers: bool = True
     trigger_all: bool = False
+    quote_reply: bool = True  # Native quote reply to customer's message
     custom_message: str = DEFAULT_CUSTOM_MESSAGE
+    custom_messages: List[str] = field(default_factory=list)  # Multi-bubble sequence
     triggers_raw: str = DEFAULT_TRIGGERS_RAW
     triggers: Dict[str, str] = field(default_factory=dict)
     ai_fallback: bool = True
     model: str = DEFAULT_MODEL
     active: bool = True
     processed_count: int = 0
+    keyword_matches_count: int = 0
+    reply_all_count: int = 0
+    ai_fallbacks_count: int = 0
+    recent_interactions: List[Dict[str, Any]] = field(default_factory=list)
     away_mode: bool = False
     away_timeout_minutes: int = 5
     last_owner_activity: Optional[datetime] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def get_bubbles(self) -> List[str]:
+        if self.custom_messages:
+            return [b for b in self.custom_messages if b.strip()]
+        if self.custom_message:
+            return split_message_bubbles(self.custom_message)
+        return [DEFAULT_CUSTOM_MESSAGE]
 
 
 # In-memory dictionary mapping user_id -> ConnectedAccount
 accounts: Dict[int, ConnectedAccount] = {}
 # Fast lookup mapping business_connection_id -> user_id
 connection_to_user: Dict[str, int] = {}
+
+
+# ---------------------------------------------------------------------------
+# Database Layer (MongoDB via Motor async driver with in-memory fallback)
+# ---------------------------------------------------------------------------
+class DatabaseManager:
+    """
+    Manages non-blocking async persistence with MongoDB.
+    Maintains collections for accounts, audit message logs, and global settings.
+    Guarantees seamless fallback to in-memory state when MongoDB is unavailable.
+    """
+
+    def __init__(self):
+        self.client: Optional[motor.motor_asyncio.AsyncIOMotorClient] = None
+        self.db = None
+        self.accounts_col = None
+        self.logs_col = None
+        self.settings_col = None
+        self.connected = False
+
+    async def connect(self):
+        if not MONGO_URI:
+            logger.warning(
+                "MONGO_URI not configured. Operating in in-memory mode with volatile persistence."
+            )
+            return
+
+        # Check for unreplaced placeholder template strings in MONGO_URI
+        if any(
+            p in MONGO_URI
+            for p in ["<password>", "<db_password>", "username:password", "<username>"]
+        ):
+            logger.error(
+                "[DB] MONGO_URI contains unreplaced placeholder text. "
+                "Operating in in-memory mode safely."
+            )
+            return
+
+        try:
+            logger.info("Connecting to MongoDB cluster...")
+            self.client = motor.motor_asyncio.AsyncIOMotorClient(
+                MONGO_URI,
+                serverSelectionTimeoutMS=4000,
+                connectTimeoutMS=4000,
+                maxPoolSize=20,
+                minPoolSize=1,
+            )
+            await self.client.admin.command("ping")
+            self.db = self.client[MONGO_DB_NAME]
+            self.accounts_col = self.db["accounts"]
+            self.logs_col = self.db["message_logs"]
+            self.settings_col = self.db["bot_settings"]
+
+            await self.accounts_col.create_index("connection_id", sparse=True)
+            await self.accounts_col.create_index("username")
+            await self.logs_col.create_index([("account_id", 1), ("timestamp", -1)])
+            await self.logs_col.create_index("timestamp")
+
+            self.connected = True
+            logger.info(
+                f"[DB] Successfully connected to MongoDB database '{MONGO_DB_NAME}'. Indexes verified."
+            )
+        except Exception as exc:
+            self.connected = False
+            if self.client:
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
+                self.client = None
+            self.db = None
+            err_msg = str(exc)
+            if (
+                "Authentication failed" in err_msg
+                or "bad auth" in err_msg
+                or "code 8000" in err_msg
+            ):
+                logger.error(
+                    "[DB] MongoDB Authentication Failed (bad auth). "
+                    "Falling back to in-memory mode safely."
+                )
+            else:
+                logger.error(
+                    f"[DB] Failed to connect to MongoDB ({err_msg}). Falling back to in-memory mode.",
+                    exc_info=False,
+                )
+
+    async def close(self):
+        if self.client:
+            self.client.close()
+            logger.info("[DB] MongoDB client connection pool closed.")
+
+    async def load_all_accounts(self) -> List[dict]:
+        if not self.connected or self.accounts_col is None:
+            return []
+        try:
+            cursor = self.accounts_col.find({})
+            return await cursor.to_list(length=100)
+        except Exception as exc:
+            logger.error(f"[DB] Error loading accounts from MongoDB: {exc}")
+            return []
+
+    async def save_account(self, account: "ConnectedAccount"):
+        if not self.connected or self.accounts_col is None:
+            return
+        try:
+            doc = {
+                "_id": account.user_id,
+                "user_id": account.user_id,
+                "connection_id": account.connection_id,
+                "username": account.username,
+                "first_name": account.first_name,
+                "can_reply": account.can_reply,
+                "is_enabled": account.is_enabled,
+                "active": account.active,
+                "away_mode": account.away_mode,
+                "away_timeout_minutes": account.away_timeout_minutes,
+                "last_owner_activity": account.last_owner_activity,
+                "keyword_triggers": account.keyword_triggers,
+                "trigger_all": account.trigger_all,
+                "quote_reply": account.quote_reply,
+                "custom_message": account.custom_message,
+                "custom_messages": account.custom_messages,
+                "triggers_raw": account.triggers_raw,
+                "triggers": account.triggers,
+                "ai_fallback": account.ai_fallback,
+                "model": account.model,
+                "processed_count": account.processed_count,
+                "keyword_matches_count": account.keyword_matches_count,
+                "reply_all_count": account.reply_all_count,
+                "ai_fallbacks_count": account.ai_fallbacks_count,
+                "recent_interactions": account.recent_interactions[:50],
+                "updated_at": datetime.now(timezone.utc),
+            }
+            await self.accounts_col.update_one(
+                {"_id": account.user_id},
+                {"$set": doc, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
+                upsert=True,
+            )
+        except Exception as exc:
+            logger.error(f"[DB] Failed to save account {account.user_id}: {exc}")
+
+    async def log_interaction(
+        self,
+        account_id: int,
+        customer_id: int,
+        customer_name: str,
+        incoming_text: str,
+        response_type: str,
+        response_text: str,
+        matched_keyword: Optional[str] = None,
+        ai_model: Optional[str] = None,
+    ):
+        if not self.connected or self.logs_col is None:
+            return
+        try:
+            log_doc = {
+                "account_id": account_id,
+                "customer_id": customer_id,
+                "customer_name": customer_name,
+                "incoming_text": incoming_text[:500],
+                "response_type": response_type,
+                "matched_keyword": matched_keyword,
+                "ai_model": ai_model,
+                "response_text": response_text[:1000],
+                "timestamp": datetime.now(timezone.utc),
+            }
+            await self.logs_col.insert_one(log_doc)
+        except Exception as exc:
+            logger.error(f"[DB] Failed to record message audit log: {exc}")
+
+    async def get_account_stats(self, account_id: int) -> dict:
+        acc = accounts.get(account_id)
+        mem_total = acc.processed_count if acc else 0
+        mem_kw = acc.keyword_matches_count if acc else 0
+        mem_all = acc.reply_all_count if acc else 0
+        mem_ai = acc.ai_fallbacks_count if acc else 0
+        mem_recent = list(acc.recent_interactions[:15]) if acc else []
+
+        if not self.connected or self.logs_col is None:
+            return {
+                "total": mem_total,
+                "triggers": mem_kw,
+                "reply_all": mem_all,
+                "ai": mem_ai,
+                "recent_logs": mem_recent,
+            }
+
+        try:
+            total = await self.logs_col.count_documents({"account_id": account_id})
+            triggers = await self.logs_col.count_documents(
+                {
+                    "account_id": account_id,
+                    "response_type": {"$in": ["keyword_trigger", "trigger"]},
+                }
+            )
+            reply_all = await self.logs_col.count_documents(
+                {"account_id": account_id, "response_type": "all_messages_custom"}
+            )
+            ai = await self.logs_col.count_documents(
+                {"account_id": account_id, "response_type": "ai_fallback"}
+            )
+
+            cursor = (
+                self.logs_col.find({"account_id": account_id})
+                .sort("timestamp", -1)
+                .limit(15)
+            )
+            db_recent = await cursor.to_list(length=15)
+
+            formatted_recent = []
+            for r in db_recent:
+                ts = r.get("timestamp")
+                ts_str = (
+                    ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    if isinstance(ts, datetime)
+                    else str(ts or "")
+                )
+                formatted_recent.append(
+                    {
+                        "customer_id": r.get("customer_id"),
+                        "customer_name": r.get("customer_name") or "Customer",
+                        "incoming_text": r.get("incoming_text", ""),
+                        "response_type": r.get("response_type", ""),
+                        "response_text": r.get("response_text", ""),
+                        "matched_keyword": r.get("matched_keyword"),
+                        "ai_model": r.get("ai_model"),
+                        "timestamp": ts_str,
+                    }
+                )
+
+            final_recent = formatted_recent or mem_recent
+
+            return {
+                "total": max(total, mem_total),
+                "triggers": max(triggers, mem_kw),
+                "reply_all": max(reply_all, mem_all),
+                "ai": max(ai, mem_ai),
+                "recent_logs": final_recent,
+            }
+        except Exception as exc:
+            logger.error(f"[DB] Error fetching account stats: {exc}")
+            return {
+                "total": mem_total,
+                "triggers": mem_kw,
+                "reply_all": mem_all,
+                "ai": mem_ai,
+                "recent_logs": mem_recent,
+            }
+
+    async def get_health_metrics(self) -> dict:
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+        mem_total = sum(a.processed_count for a in accounts.values())
+        mem_kw = sum(a.keyword_matches_count for a in accounts.values())
+        mem_all = sum(a.reply_all_count for a in accounts.values())
+        mem_ai = sum(a.ai_fallbacks_count for a in accounts.values())
+
+        if not self.connected or self.client is None or self.db is None:
+            return {
+                "connected": False,
+                "accounts_saved": len(accounts),
+                "messages_logged": mem_total,
+                "triggers_matched": mem_kw,
+                "reply_all_sent": mem_all,
+                "ai_fallbacks_generated": mem_ai,
+                "last_heartbeat": now_str,
+            }
+        try:
+            await self.client.admin.command("ping")
+            accounts_count = await self.accounts_col.count_documents({})
+            messages_count = await self.logs_col.count_documents({})
+            triggers_count = await self.logs_col.count_documents(
+                {"response_type": {"$in": ["keyword_trigger", "trigger"]}}
+            )
+            reply_all_count = await self.logs_col.count_documents(
+                {"response_type": "all_messages_custom"}
+            )
+            ai_count = await self.logs_col.count_documents(
+                {"response_type": "ai_fallback"}
+            )
+            return {
+                "connected": True,
+                "accounts_saved": accounts_count,
+                "messages_logged": max(messages_count, mem_total),
+                "triggers_matched": max(triggers_count, mem_kw),
+                "reply_all_sent": max(reply_all_count, mem_all),
+                "ai_fallbacks_generated": max(ai_count, mem_ai),
+                "last_heartbeat": now_str,
+            }
+        except Exception as exc:
+            logger.error(f"[DB] Health heartbeat ping failed: {exc}")
+            return {
+                "connected": False,
+                "accounts_saved": len(accounts),
+                "messages_logged": mem_total,
+                "triggers_matched": mem_kw,
+                "reply_all_sent": mem_all,
+                "ai_fallbacks_generated": mem_ai,
+                "last_heartbeat": now_str,
+            }
+
+
+db_manager = DatabaseManager()
+
+
+# ---------------------------------------------------------------------------
+# Interaction Audit & Telemetry Recorder
+# ---------------------------------------------------------------------------
+async def record_account_interaction(
+    account: ConnectedAccount,
+    customer_id: int,
+    customer_name: str,
+    incoming_text: str,
+    response_type: str,
+    response_text: str,
+    matched_keyword: Optional[str] = None,
+    ai_model: Optional[str] = None,
+):
+    """
+    Records customer interaction in memory and persists to MongoDB asynchronously.
+    Updates specific analytics counters reliably.
+    """
+    account.processed_count += 1
+    if response_type in ("keyword_trigger", "trigger"):
+        account.keyword_matches_count += 1
+    elif response_type == "all_messages_custom":
+        account.reply_all_count += 1
+    elif response_type == "ai_fallback":
+        account.ai_fallbacks_count += 1
+
+    interaction = {
+        "account_id": account.user_id,
+        "customer_id": customer_id,
+        "customer_name": customer_name,
+        "incoming_text": incoming_text[:300],
+        "response_type": response_type,
+        "response_text": response_text[:500],
+        "matched_keyword": matched_keyword,
+        "ai_model": ai_model,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+    account.recent_interactions.insert(0, interaction)
+    if len(account.recent_interactions) > 50:
+        account.recent_interactions = account.recent_interactions[:50]
+
+    # Save to MongoDB
+    await db_manager.save_account(account)
+    await db_manager.log_interaction(
+        account_id=account.user_id,
+        customer_id=customer_id,
+        customer_name=customer_name,
+        incoming_text=incoming_text,
+        response_type=response_type,
+        response_text=response_text,
+        matched_keyword=matched_keyword,
+        ai_model=ai_model,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -437,11 +579,14 @@ def normalize_links_for_preview(text: str) -> str:
 
 
 async def send_business_message(
-    business_connection_id: str, chat_id: int, text: str
+    business_connection_id: str,
+    chat_id: int,
+    text: str,
+    reply_to_message_id: Optional[int] = None,
 ) -> bool:
     """
     Send a message in a private DM on behalf of the connected business account.
-    Guarantees rich preview cards (image, title, join group button) for Telegram invite links.
+    Supports quoting/replying to a specific customer message and renders rich preview cards.
     """
     formatted_text = normalize_links_for_preview(text)
     payload = {
@@ -455,8 +600,53 @@ async def send_business_message(
         },
         "disable_web_page_preview": False,
     }
+    if reply_to_message_id:
+        payload["reply_parameters"] = {
+            "message_id": reply_to_message_id,
+            "allow_sending_without_reply": True,
+        }
+        payload["reply_to_message_id"] = reply_to_message_id
+
     result = await tg_api_call("sendMessage", payload)
     return result is not None
+
+
+async def send_business_messages_sequence(
+    business_connection_id: str,
+    chat_id: int,
+    messages: List[str],
+    reply_to_message_id: Optional[int] = None,
+) -> bool:
+    """
+    Sends multiple response bubbles in order.
+    Bubble #1 directly replies to/quotes customer's message ID when enabled.
+    Subsequent bubbles follow with natural typing indicators and rhythmic pauses.
+    """
+    if not messages:
+        return False
+
+    success_any = False
+    for i, msg in enumerate(messages):
+        msg = msg.strip()
+        if not msg:
+            continue
+
+        target_reply = reply_to_message_id if i == 0 else None
+
+        if i > 0:
+            await send_typing_indicator(business_connection_id, chat_id)
+            await asyncio.sleep(0.9)  # Natural human typing delay
+
+        success = await send_business_message(
+            business_connection_id=business_connection_id,
+            chat_id=chat_id,
+            text=msg,
+            reply_to_message_id=target_reply,
+        )
+        if success:
+            success_any = True
+
+    return success_any
 
 
 # ---------------------------------------------------------------------------
@@ -520,11 +710,12 @@ async def generate_openrouter_reply(user_message: str, model: str) -> Optional[s
 
 
 # ---------------------------------------------------------------------------
-# Business Message Processing Pipeline (Triggers -> AI Fallback)
+# Business Message Processing Pipeline (Multi-Bubble + Reply-To + Analytics)
 # ---------------------------------------------------------------------------
 async def process_business_message(message: dict):
     """
     Handles incoming private DMs sent to any connected business account.
+    Supports multi-response sequences and direct quote replies.
     """
     connection_id = message.get("business_connection_id")
     if not connection_id:
@@ -548,7 +739,9 @@ async def process_business_message(message: dict):
 
     # Smart Away Mode: Suppress bot response when the account owner is active
     if account.away_mode and account.last_owner_activity:
-        idle_seconds = (datetime.now(timezone.utc) - account.last_owner_activity).total_seconds()
+        idle_seconds = (
+            datetime.now(timezone.utc) - account.last_owner_activity
+        ).total_seconds()
         timeout_seconds = account.away_timeout_minutes * 60
         if idle_seconds < timeout_seconds:
             remaining_mins = max(1, int((timeout_seconds - idle_seconds) / 60))
@@ -566,6 +759,10 @@ async def process_business_message(message: dict):
     raw_text = (message.get("text") or message.get("caption") or "").strip()
     if not raw_text or not chat_id:
         return
+
+    incoming_msg_id = message.get("message_id")
+    # Native direct quote reply: only reply if quote_reply is enabled
+    target_reply_id = incoming_msg_id if account.quote_reply else None
 
     customer_name = (
         f"{sender.get('first_name', '')} {sender.get('last_name', '')}".strip()
@@ -593,17 +790,19 @@ async def process_business_message(message: dict):
 
         if matched_reply:
             logger.info(
-                f"[Account @{account.username or account.user_id}] Keyword condition matched '{matched_keyword}'. Sending specific reply."
+                f"[Account @{account.username or account.user_id}] Keyword condition matched '{matched_keyword}'. Sending reply sequence."
             )
-            success = await send_business_message(
-                account.connection_id, chat_id, matched_reply
+            bubbles = split_message_bubbles(matched_reply)
+            success = await send_business_messages_sequence(
+                account.connection_id,
+                chat_id,
+                bubbles,
+                reply_to_message_id=target_reply_id,
             )
             if success:
-                account.processed_count += 1
-                asyncio.create_task(db_manager.increment_processed_count(account.user_id))
                 asyncio.create_task(
-                    db_manager.log_interaction(
-                        account_id=account.user_id,
+                    record_account_interaction(
+                        account=account,
                         customer_id=sender_id,
                         customer_name=customer_name,
                         incoming_text=raw_text,
@@ -629,17 +828,16 @@ async def process_business_message(message: dict):
             await send_typing_indicator(account.connection_id, chat_id)
             ai_reply = await generate_openrouter_reply(raw_text, account.model)
             if ai_reply:
-                success = await send_business_message(
-                    account.connection_id, chat_id, ai_reply
+                success = await send_business_messages_sequence(
+                    account.connection_id,
+                    chat_id,
+                    [ai_reply],
+                    reply_to_message_id=target_reply_id,
                 )
                 if success:
-                    account.processed_count += 1
                     asyncio.create_task(
-                        db_manager.increment_processed_count(account.user_id)
-                    )
-                    asyncio.create_task(
-                        db_manager.log_interaction(
-                            account_id=account.user_id,
+                        record_account_interaction(
+                            account=account,
                             customer_id=sender_id,
                             customer_name=customer_name,
                             incoming_text=raw_text,
@@ -666,25 +864,26 @@ async def process_business_message(message: dict):
     # -----------------------------------------------------------------------
     # Step B: Keyword Trigger is OFF -> Reply to ALL Messages Mode
     # -----------------------------------------------------------------------
-    # "if off then it will reply on all keywords (no matter what that keyword)"
-    reply_content = account.custom_message or DEFAULT_CUSTOM_MESSAGE
+    bubbles = account.get_bubbles()
     logger.info(
-        f"[Account @{account.username or account.user_id}] Keyword Trigger is OFF. Replying to message with Customized Auto-Reply Message."
+        f"[Account @{account.username or account.user_id}] Keyword Trigger is OFF. Replying with {len(bubbles)} sequential response bubble(s)."
     )
-    success = await send_business_message(
-        account.connection_id, chat_id, reply_content
+    success = await send_business_messages_sequence(
+        account.connection_id,
+        chat_id,
+        bubbles,
+        reply_to_message_id=target_reply_id,
     )
     if success:
-        account.processed_count += 1
-        asyncio.create_task(db_manager.increment_processed_count(account.user_id))
+        combined_text = " \n---\n ".join(bubbles)
         asyncio.create_task(
-            db_manager.log_interaction(
-                account_id=account.user_id,
+            record_account_interaction(
+                account=account,
                 customer_id=sender_id,
                 customer_name=customer_name,
                 incoming_text=raw_text,
                 response_type="all_messages_custom",
-                response_text=reply_content,
+                response_text=combined_text,
                 matched_keyword="[ALL_MESSAGES]",
             )
         )
@@ -731,6 +930,9 @@ async def process_business_connection(conn: dict):
             first_name=first_name,
             can_reply=can_reply,
             is_enabled=is_enabled,
+            quote_reply=True,
+            custom_message=DEFAULT_CUSTOM_MESSAGE,
+            custom_messages=[DEFAULT_CUSTOM_MESSAGE],
             triggers_raw=DEFAULT_TRIGGERS_RAW,
             triggers=parse_triggers(DEFAULT_TRIGGERS_RAW),
             ai_fallback=True,
@@ -748,11 +950,11 @@ async def process_business_connection(conn: dict):
 
 
 # ---------------------------------------------------------------------------
-# Interactive Telegram DM Setup Wizard (Matches Provided UI Blueprint)
+# Interactive Telegram DM Setup Wizard
 # ---------------------------------------------------------------------------
 def build_accounts_menu() -> tuple[str, list]:
     """
-    Screen 1: Main accounts selection menu (inspired by image 1).
+    Screen 1: Main accounts selection menu.
     """
     text = (
         "<b>⚙️ Manage Account Settings</b>\n"
@@ -804,7 +1006,7 @@ def build_accounts_menu() -> tuple[str, list]:
 
 def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
     """
-    Screen 2: Detailed Account Settings panel (inspired by image 1 & 2).
+    Screen 2: Detailed Account Settings panel.
     """
     status_text = "Active ✅ (Replying)" if (acc.active and acc.can_reply) else "Paused ⏸️"
     ai_status = "✅ ENABLED" if acc.ai_fallback else "❌ DISABLED"
@@ -813,10 +1015,10 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
         if acc.away_mode
         else "❌ DISABLED (Always active)"
     )
-    trig_all_status = (
-        "✅ ENABLED (Replies to all DMs)"
-        if acc.trigger_all
-        else "❌ DISABLED (Keyword rules only)"
+    quote_status = (
+        "✅ ENABLED (Quotes customer message)"
+        if acc.quote_reply
+        else "❌ DISABLED (Standalone bubble)"
     )
 
     if not acc.last_owner_activity:
@@ -830,19 +1032,18 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
         else:
             presence_str = f"💤 OFFLINE (Idle for {int(idle_s / 60)}m)"
 
-    triggers_count = len(acc.triggers)
-    custom_snippet = (
-        (acc.custom_message[:40] + "...")
-        if len(acc.custom_message) > 40
-        else acc.custom_message
-    )
+    bubbles = acc.get_bubbles()
+    bubble_count = len(bubbles)
+    first_snippet = bubbles[0][:32] + "..." if len(bubbles[0]) > 32 else bubbles[0]
 
     if acc.keyword_triggers:
         mode_str = "🔑 KEYWORD CONDITIONS (Specific replies per keyword)"
         kw_btn_text = "🔑 Keywords: ON"
     else:
-        mode_str = "💬 REPLY TO ALL (Custom reply for all messages)"
+        mode_str = f"💬 REPLY TO ALL ({bubble_count} sequential bubbles)"
         kw_btn_text = "💬 Keywords: OFF (Reply All)"
+
+    quote_btn_text = "↩️ Quote: ON" if acc.quote_reply else "↩️ Quote: OFF"
 
     text = (
         f"<b>SETTINGS</b>\n"
@@ -851,10 +1052,11 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
         f"• <b>Owner Presence:</b> {presence_str}\n"
         f"• <b>Smart Away Mode:</b> {away_status}\n"
         f"• <b>Active Mode:</b> {mode_str}\n"
-        f"• <b>Custom Message:</b> <i>{html.escape(custom_snippet)}</i>\n"
+        f"• <b>Direct Quote Reply:</b> {quote_status}\n"
+        f"• <b>Response Bubbles:</b> {bubble_count} bubble(s) [<i>{html.escape(first_snippet)}</i>]\n"
         f"• <b>AI Fallback:</b> {ai_status}\n"
         f"• <b>AI Model:</b> <code>{html.escape(acc.model)}</code>\n"
-        f"• <b>Keyword Conditions:</b> {triggers_count} active rule(s)\n"
+        f"• <b>Keyword Conditions:</b> {len(acc.triggers)} active rule(s)\n"
         f"• <b>DMs Auto-Responded:</b> {acc.processed_count}\n\n"
         f"<i>Select one of the settings that you want to change:</i>"
     )
@@ -877,7 +1079,14 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
         ],
         [
             {"text": kw_btn_text, "callback_data": f"tog_kw_{acc.user_id}"},
-            {"text": "💬 Custom Message", "callback_data": f"cust_msg_menu_{acc.user_id}"},
+            {"text": quote_btn_text, "callback_data": f"tog_quote_{acc.user_id}"},
+        ],
+        [
+            {
+                "text": f"💬 Response Bubbles ({bubble_count})",
+                "callback_data": f"cust_msg_menu_{acc.user_id}",
+            },
+            {"text": "📊 Analytics", "callback_data": f"acc_stats_{acc.user_id}"},
         ],
         [
             {"text": "📝 View Triggers", "callback_data": f"view_trig_{acc.user_id}"},
@@ -885,16 +1094,62 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
         ],
         [
             {"text": "🧠 Change Model", "callback_data": f"pick_mod_{acc.user_id}"},
-            {"text": "📊 Analytics", "callback_data": f"acc_stats_{acc.user_id}"},
+            {"text": "🔄 Reload", "callback_data": f"acc_{acc.user_id}"},
         ],
         [
             {"text": "⬅️ Back", "callback_data": "back_to_accounts"},
             {"text": "✅ Close", "callback_data": "close_menu"},
-            {"text": "🔄 Reload", "callback_data": f"acc_{acc.user_id}"},
         ],
     ]
 
     return text, keyboard
+
+
+def build_bubbles_menu(acc: ConnectedAccount) -> tuple[str, list]:
+    """
+    Submenu: Manage multiple response bubbles for an account.
+    """
+    bubbles = acc.get_bubbles()
+    bubbles_display = ""
+    for i, b in enumerate(bubbles, 1):
+        first_tag = " (Quotes Customer)" if (i == 1 and acc.quote_reply) else ""
+        bubbles_display += f"<b>Bubble #{i}{first_tag}:</b>\n<blockquote>{html.escape(b)}</blockquote>\n"
+
+    quote_status_str = "ON (Quotes incoming DM) ↩️" if acc.quote_reply else "OFF (Standalone)"
+
+    text = (
+        f"<b>💬 MULTI-RESPONSE BUBBLE MANAGER</b>\n"
+        f"<b>Account:</b> @{html.escape(acc.username or str(acc.user_id))} ({html.escape(acc.first_name)})\n\n"
+        f"• <b>Configured Bubbles:</b> {len(bubbles)}\n"
+        f"• <b>Direct Quote Reply:</b> {quote_status_str}\n\n"
+        f"{bubbles_display}\n"
+        f"💡 <b>Multi-Bubble & Timing Features:</b>\n"
+        f"• The bot sends all configured bubbles sequentially with natural typing pauses.\n"
+        f"• Bubble #1 directly quotes/replies to the customer's message.\n"
+        f"• Group/channel links (e.g. <code>https://t.me/+...</code>) render rich preview cards automatically.\n"
+        f"• Tap <b>'➕ Add Next Bubble'</b> or <b>'🗑️ Remove Last'</b> to adjust dynamically."
+    )
+
+    kb = [
+        [
+            {"text": "➕ Add Next Bubble", "callback_data": f"add_bubble_{acc.user_id}"},
+            {"text": "🗑️ Remove Last Bubble", "callback_data": f"rem_bubble_{acc.user_id}"},
+        ],
+        [
+            {"text": "✏️ Edit Bubble #1", "callback_data": f"edit_bubble_{acc.user_id}_0"},
+            {"text": "👁️ Test Sequence Preview", "callback_data": f"test_preview_{acc.user_id}"},
+        ],
+        [
+            {
+                "text": f"↩️ Quote Reply: {'ON' if acc.quote_reply else 'OFF'}",
+                "callback_data": f"tog_quote_sub_{acc.user_id}",
+            },
+            {"text": "🔄 Reset Default", "callback_data": f"reset_cust_msg_{acc.user_id}"},
+        ],
+        [{"text": "⬅️ Back to Settings", "callback_data": f"acc_{acc.user_id}"}],
+    ]
+
+    return text, kb
 
 
 async def handle_callback_query(cq: dict):
@@ -946,13 +1201,19 @@ async def handle_callback_query(cq: dict):
     if data == "sys_stats":
         active_count = sum(1 for a in accounts.values() if a.active and a.can_reply)
         total_dms = sum(a.processed_count for a in accounts.values())
+        total_kw = sum(a.keyword_matches_count for a in accounts.values())
+        total_all = sum(a.reply_all_count for a in accounts.values())
+        total_ai = sum(a.ai_fallbacks_count for a in accounts.values())
         db_status = "Connected ✅" if db_manager.connected else "In-Memory (Volatile) ⚠️"
         stat_text = (
             f"<b>📊 SYSTEM ANALYTICS & STATUS</b>\n\n"
             f"• <b>Bot Username:</b> @{html.escape(bot_info.get('username', ''))}\n"
             f"• <b>Total Connected Accounts:</b> {len(accounts)}\n"
             f"• <b>Active Auto-Responders:</b> {active_count}\n"
-            f"• <b>Total Messages Handled:</b> {total_dms}\n"
+            f"• <b>Total DMs Responded:</b> <b>{total_dms}</b>\n"
+            f"• 🔑 <b>Keyword Matches:</b> {total_kw}\n"
+            f"• 💬 <b>Reply-All Custom Replies:</b> {total_all}\n"
+            f"• 🤖 <b>AI Generated Fallbacks:</b> {total_ai}\n"
             f"• <b>MongoDB Persistence:</b> {db_status}\n"
             f"• <b>OpenRouter API:</b> {'Ready ✅' if OPENROUTER_API_KEY else 'Not Set ❌'}\n"
         )
@@ -964,7 +1225,7 @@ async def handle_callback_query(cq: dict):
     if data == "bulk_sync_menu":
         confirm_text = (
             "<b>⚡ Bulk Synchronization Tool</b>\n\n"
-            "This action will overwrite keyword triggers, AI fallback toggle, "
+            "This action will overwrite keyword triggers, response bubbles, AI fallback toggle, "
             "and default AI models across <b>ALL</b> connected accounts simultaneously.\n\n"
             "Do you want to proceed?"
         )
@@ -986,6 +1247,9 @@ async def handle_callback_query(cq: dict):
         for acc in accounts.values():
             acc.triggers_raw = DEFAULT_TRIGGERS_RAW
             acc.triggers = default_parsed
+            acc.custom_message = DEFAULT_CUSTOM_MESSAGE
+            acc.custom_messages = [DEFAULT_CUSTOM_MESSAGE]
+            acc.quote_reply = True
             acc.ai_fallback = True
             acc.model = DEFAULT_MODEL
             await db_manager.save_account(acc)
@@ -1055,7 +1319,11 @@ async def handle_callback_query(cq: dict):
         acc = accounts.get(uid)
         if acc:
             delays = [2, 5, 10, 15]
-            curr_idx = delays.index(acc.away_timeout_minutes) if acc.away_timeout_minutes in delays else 1
+            curr_idx = (
+                delays.index(acc.away_timeout_minutes)
+                if acc.away_timeout_minutes in delays
+                else 1
+            )
             next_delay = delays[(curr_idx + 1) % len(delays)]
             acc.away_timeout_minutes = next_delay
             await db_manager.save_account(acc)
@@ -1076,85 +1344,134 @@ async def handle_callback_query(cq: dict):
             if acc.keyword_triggers:
                 status_msg = "🔑 Keyword Conditions Mode ON: Bot will check different keywords for different replies."
             else:
-                status_msg = "💬 Reply to All Mode ON: Bot will reply to ALL incoming messages with your custom message (regardless of keyword)."
+                status_msg = "💬 Reply to All Mode ON: Bot will reply to ALL incoming messages with your custom bubbles."
             await answer(status_msg, alert=True)
             text, kb = build_account_settings_menu(acc)
             await edit(text, kb)
         return
 
-    # Customize Message Submenu
+    # Toggle Direct Quote Reply
+    if data.startswith(("tog_quote_", "tog_quote_sub_")):
+        is_sub = "sub" in data
+        parts = data.split("_")
+        uid = int(parts[-1])
+        acc = accounts.get(uid)
+        if acc:
+            acc.quote_reply = not acc.quote_reply
+            await db_manager.save_account(acc)
+            status_msg = (
+                "↩️ Direct Quote Reply ON: Bot will directly quote the customer's message!"
+                if acc.quote_reply
+                else "Direct Quote Reply OFF: Bot will send standalone message bubbles."
+            )
+            await answer(status_msg, alert=True)
+            if is_sub:
+                text, kb = build_bubbles_menu(acc)
+            else:
+                text, kb = build_account_settings_menu(acc)
+            await edit(text, kb)
+        return
+
+    # Customize Message & Multi-Bubble Submenu
     if data.startswith("cust_msg_menu_"):
         uid = int(data.split("_")[3])
         acc = accounts.get(uid)
         if not acc:
             return
-        cust_text = (
-            f"<b>💬 CUSTOMIZE AUTO-REPLY MESSAGE</b>\n"
-            f"<b>Account:</b> @{html.escape(acc.username or str(uid))} ({html.escape(acc.first_name)})\n\n"
-            f"<b>Active Message:</b>\n"
-            f"<blockquote>{html.escape(acc.custom_message)}</blockquote>\n\n"
-            f"💡 <b>Tips & Link Preview Support:</b>\n"
-            f"• You can put text, emojis, and group/channel invite links (e.g. <code>https://t.me/+...</code>).\n"
-            f"• Telegram automatically generates the rich preview card with group photo and Join/View button (matching Image 2)!\n"
-            f"• Tap <b>'👁️ Test Link Preview'</b> below to test how it looks in chat right now."
-        )
-        kb = [
-            [
-                {"text": "✏️ Edit Custom Message", "callback_data": f"edit_cust_msg_{uid}"},
-                {"text": "👁️ Test Link Preview", "callback_data": f"test_preview_{uid}"},
-            ],
-            [
-                {"text": "🔄 Reset Default", "callback_data": f"reset_cust_msg_{uid}"},
-                {"text": "⬅️ Back to Settings", "callback_data": f"acc_{uid}"},
-            ],
-        ]
-        await edit(cust_text, kb)
+        text, kb = build_bubbles_menu(acc)
+        await edit(text, kb)
         await answer()
         return
 
-    # Edit Custom Message Prompt
-    if data.startswith("edit_cust_msg_"):
-        uid = int(data.split("_")[3])
+    # Add Bubble Action (Prompt for text input)
+    if data.startswith("add_bubble_"):
+        uid = int(data.split("_")[2])
         acc = accounts.get(uid)
         if not acc:
             return
+        curr_count = len(acc.get_bubbles())
         user_wizard_state[from_user_id] = {
-            "action": "awaiting_custom_message",
+            "action": "awaiting_add_bubble",
             "target_account_id": uid,
         }
         prompt_text = (
-            f"<b>✏️ Edit Custom Reply Message for @{html.escape(acc.username or str(uid))}</b>\n\n"
-            f"Send your new custom reply message in your next chat message.\n\n"
-            f"<b>Example (Text + Invite Link):</b>\n"
-            f"<code>Hello! Thanks for reaching out. Join our exclusive group:\nhttps://t.me/+G2ltaftHIqswMGU1</code>\n\n"
-            f"<i>Telegram will automatically attach the rich link preview card!</i>"
+            f"<b>➕ Add Response Bubble #{curr_count + 1} for @{html.escape(acc.username or str(uid))}</b>\n\n"
+            f"Send the text or invite link for this new bubble in your next chat message.\n\n"
+            f"<i>The bot will send it in sequence after Bubble #{curr_count} with a natural typing delay.</i>"
         )
         kb = [[{"text": "⬅️ Cancel", "callback_data": f"cust_msg_menu_{uid}"}]]
         await edit(prompt_text, kb)
         await answer()
         return
 
-    # Test Link Preview in User's DM
+    # Remove Last Bubble Action
+    if data.startswith("rem_bubble_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if not acc:
+            return
+        bubbles = acc.get_bubbles()
+        if len(bubbles) <= 1:
+            await answer("Cannot remove: At least 1 response bubble is required!", alert=True)
+            return
+        removed = bubbles.pop()
+        acc.custom_messages = bubbles
+        acc.custom_message = "\n---\n".join(bubbles)
+        await db_manager.save_account(acc)
+        await answer(f"Removed Bubble #{len(bubbles) + 1}", alert=True)
+        text, kb = build_bubbles_menu(acc)
+        await edit(text, kb)
+        return
+
+    # Edit Specific Bubble
+    if data.startswith("edit_bubble_"):
+        parts = data.split("_")
+        uid = int(parts[2])
+        bubble_idx = int(parts[3])
+        acc = accounts.get(uid)
+        if not acc:
+            return
+        user_wizard_state[from_user_id] = {
+            "action": "awaiting_edit_bubble",
+            "target_account_id": uid,
+            "bubble_idx": bubble_idx,
+        }
+        prompt_text = (
+            f"<b>✏️ Edit Response Bubble #{bubble_idx + 1} for @{html.escape(acc.username or str(uid))}</b>\n\n"
+            f"Send the new text for Bubble #{bubble_idx + 1} in your next chat message.\n\n"
+            f"<b>Supports plain text and invite links:</b>\n"
+            f"<code>https://t.me/+...</code>"
+        )
+        kb = [[{"text": "⬅️ Cancel", "callback_data": f"cust_msg_menu_{uid}"}]]
+        await edit(prompt_text, kb)
+        await answer()
+        return
+
+    # Test Multi-Message Sequence Preview in User's DM
     if data.startswith("test_preview_"):
         uid = int(data.split("_")[2])
         acc = accounts.get(uid)
         if not acc:
             return
-        await answer("Sending preview card below... 👇")
-        preview_text = normalize_links_for_preview(acc.custom_message)
-        await tg_api_call(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": preview_text,
-                "link_preview_options": {
-                    "is_disabled": False,
-                    "prefer_large_media": True,
-                    "show_above_text": False,
+        await answer("Sending sequence preview below... 👇")
+        bubbles = acc.get_bubbles()
+        for i, b in enumerate(bubbles):
+            if i > 0:
+                await asyncio.sleep(0.9)
+            preview_text = normalize_links_for_preview(b)
+            await tg_api_call(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": preview_text,
+                    "link_preview_options": {
+                        "is_disabled": False,
+                        "prefer_large_media": True,
+                        "show_above_text": False,
+                    },
+                    "disable_web_page_preview": False,
                 },
-                "disable_web_page_preview": False,
-            },
-        )
+            )
         return
 
     # Reset Custom Message to Default
@@ -1163,29 +1480,11 @@ async def handle_callback_query(cq: dict):
         acc = accounts.get(uid)
         if acc:
             acc.custom_message = DEFAULT_CUSTOM_MESSAGE
+            acc.custom_messages = [DEFAULT_CUSTOM_MESSAGE]
             await db_manager.save_account(acc)
-            await answer("Reset to default auto-reply message.", alert=True)
-            cust_text = (
-                f"<b>💬 CUSTOMIZE AUTO-REPLY MESSAGE</b>\n"
-                f"<b>Account:</b> @{html.escape(acc.username or str(uid))} ({html.escape(acc.first_name)})\n\n"
-                f"<b>Active Message:</b>\n"
-                f"<blockquote>{html.escape(acc.custom_message)}</blockquote>\n\n"
-                f"💡 <b>Tips & Link Preview Support:</b>\n"
-                f"• You can put text, emojis, and group/channel invite links (e.g. <code>https://t.me/+...</code>).\n"
-                f"• Telegram automatically generates the rich preview card with group photo and Join/View button!\n"
-                f"• Tap <b>'👁️ Test Link Preview'</b> below to test how it looks in chat right now."
-            )
-            kb = [
-                [
-                    {"text": "✏️ Edit Custom Message", "callback_data": f"edit_cust_msg_{uid}"},
-                    {"text": "👁️ Test Link Preview", "callback_data": f"test_preview_{uid}"},
-                ],
-                [
-                    {"text": "🔄 Reset Default", "callback_data": f"reset_cust_msg_{uid}"},
-                    {"text": "⬅️ Back to Settings", "callback_data": f"acc_{uid}"},
-                ],
-            ]
-            await edit(cust_text, kb)
+            await answer("Reset to default auto-reply bubble.", alert=True)
+            text, kb = build_bubbles_menu(acc)
+            await edit(text, kb)
         return
 
     # Pick Model Menu
@@ -1253,7 +1552,9 @@ async def handle_callback_query(cq: dict):
             trig_list_text += "<i>No triggers configured. Messages default to AI fallback.</i>"
         else:
             for idx, (kw, resp) in enumerate(acc.triggers.items(), 1):
-                trig_list_text += f"{idx}. <b>\"{html.escape(kw)}\"</b> ➔ <i>{html.escape(resp[:60])}...</i>\n"
+                trig_list_text += (
+                    f"{idx}. <b>\"{html.escape(kw)}\"</b> ➔ <i>{html.escape(resp[:60])}...</i>\n"
+                )
 
         kb = [
             [
@@ -1307,22 +1608,72 @@ async def handle_callback_query(cq: dict):
         await answer()
         return
 
-    # Account Analytics
+    # Account Analytics & Live Interaction Audit Log
     if data.startswith("acc_stats_"):
         uid = int(data.split("_")[2])
         acc = accounts.get(uid)
         if not acc:
             return
         stats = await db_manager.get_account_stats(uid)
+        total_dms = stats.get("total", 0)
+        kw_matches = stats.get("triggers", 0)
+        reply_all = stats.get("reply_all", 0)
+        ai_count = stats.get("ai", 0)
+        recent_logs = stats.get("recent_logs", [])
+
+        if not acc.last_owner_activity:
+            presence_str = "💤 OFFLINE"
+        else:
+            idle_s = int(
+                (datetime.now(timezone.utc) - acc.last_owner_activity).total_seconds()
+            )
+            if idle_s < (acc.away_timeout_minutes * 60):
+                presence_str = f"🟢 ONLINE ({int(idle_s / 60)}m ago)"
+            else:
+                presence_str = f"💤 OFFLINE (Idle for {int(idle_s / 60)}m)"
+
         stat_text = (
-            f"<b>📊 Account Analytics: @{html.escape(acc.username or str(uid))}</b>\n\n"
-            f"• <b>Total DMs Processed:</b> {acc.processed_count}\n"
-            f"• <b>Trigger Keyword Matches:</b> {stats.get('triggers', 0)}\n"
-            f"• <b>AI Generated Fallbacks:</b> {stats.get('ai', 0)}\n"
-            f"• <b>Configured Model:</b> <code>{html.escape(acc.model)}</code>\n"
-            f"• <b>Active Status:</b> {'Replying ✅' if acc.active else 'Paused ⏸️'}\n"
+            f"<b>📊 Account Analytics & Audit Log</b>\n"
+            f"<b>Account:</b> @{html.escape(acc.username or str(uid))} ({html.escape(acc.first_name)})\n\n"
+            f"• <b>Total DMs Responded:</b> <b>{total_dms}</b>\n"
+            f"• 🔑 <b>Keyword Matches:</b> {kw_matches}\n"
+            f"• 💬 <b>Reply-All Custom Replies:</b> {reply_all}\n"
+            f"• 🤖 <b>AI Generated Fallbacks:</b> {ai_count}\n"
+            f"• ↩️ <b>Direct Quote Reply:</b> {'ENABLED ✅' if acc.quote_reply else 'DISABLED ❌'}\n"
+            f"• ⚡ <b>Status:</b> {'Replying ✅' if acc.active else 'Paused ⏸️'}\n"
+            f"• 🌙 <b>Owner Presence:</b> {presence_str}\n\n"
+            f"<b>📜 Recent Customer Interactions:</b>\n"
         )
-        kb = [[{"text": "⬅️ Back to Settings", "callback_data": f"acc_{uid}"}]]
+
+        if not recent_logs:
+            stat_text += "<i>No incoming customer DMs recorded yet. When customers message your account, their messages and bot replies will show here!</i>\n"
+        else:
+            for i, log_item in enumerate(recent_logs[:5], 1):
+                c_name = html.escape(
+                    str(
+                        log_item.get("customer_name")
+                        or log_item.get("customer_id")
+                        or "Customer"
+                    )
+                )
+                in_msg = html.escape(str(log_item.get("incoming_text", ""))[:45])
+                out_msg = html.escape(str(log_item.get("response_text", ""))[:45])
+                rtype = log_item.get("response_type", "")
+                badge = (
+                    "🔑 Keyword"
+                    if "keyword" in rtype
+                    else ("💬 Reply-All" if "all" in rtype else "🤖 AI")
+                )
+                stat_text += (
+                    f"{i}. 👤 <b>{c_name}</b> ({badge})\n"
+                    f"   📥 <i>\"{in_msg}\"</i>\n"
+                    f"   📤 <i>\"{out_msg}\"</i>\n"
+                )
+
+        kb = [
+            [{"text": "🔄 Refresh Analytics", "callback_data": f"acc_stats_{uid}"}],
+            [{"text": "⬅️ Back to Settings", "callback_data": f"acc_{uid}"}],
+        ]
         await edit(stat_text, kb)
         await answer()
         return
@@ -1400,29 +1751,80 @@ async def run_bot_polling():
                     if text.startswith("/"):
                         user_wizard_state.pop(from_user_id, None)
 
-                    # Handle Wizard Text Input (e.g. adding a trigger rule or editing custom message)
+                    # Handle Wizard Text Input
                     if from_user_id in user_wizard_state:
                         state = user_wizard_state.pop(from_user_id)
                         action = state.get("action")
                         target_id = state.get("target_account_id")
                         acc = accounts.get(target_id)
 
-                        if action == "awaiting_custom_message" and acc and text:
-                            acc.custom_message = text
+                        # Awaiting new response bubble
+                        if action == "awaiting_add_bubble" and acc and text:
+                            bubbles = acc.get_bubbles()
+                            bubbles.append(text)
+                            acc.custom_messages = bubbles
+                            acc.custom_message = "\n---\n".join(bubbles)
                             await db_manager.save_account(acc)
+
                             confirm_msg = (
-                                f"✅ <b>Custom Message Saved for @{html.escape(acc.username or str(target_id))}!</b>\n\n"
-                                f"Below is how your message will appear in private DMs (with rich link preview):"
+                                f"✅ <b>Added Response Bubble #{len(bubbles)} for @{html.escape(acc.username or str(target_id))}!</b>\n\n"
+                                f"<blockquote>{html.escape(text)}</blockquote>\n"
+                                f"Total bubbles now: {len(bubbles)}. Sent sequentially with natural typing pauses."
                             )
                             kb = [
                                 [
                                     {
-                                        "text": "⬅️ Back to Settings",
-                                        "callback_data": f"acc_{target_id}",
+                                        "text": "💬 Bubble Manager",
+                                        "callback_data": f"cust_msg_menu_{target_id}",
                                     },
                                     {
-                                        "text": "💬 Custom Message Menu",
+                                        "text": "👁️ Test Sequence Preview",
+                                        "callback_data": f"test_preview_{target_id}",
+                                    },
+                                ],
+                                [
+                                    {
+                                        "text": "⬅️ Back to Settings",
+                                        "callback_data": f"acc_{target_id}",
+                                    }
+                                ],
+                            ]
+                            await tg_api_call(
+                                "sendMessage",
+                                {
+                                    "chat_id": chat_id,
+                                    "text": confirm_msg,
+                                    "parse_mode": "HTML",
+                                    "reply_markup": {"inline_keyboard": kb},
+                                },
+                            )
+                            continue
+
+                        # Awaiting edit of a specific bubble
+                        elif action == "awaiting_edit_bubble" and acc and text:
+                            b_idx = state.get("bubble_idx", 0)
+                            bubbles = acc.get_bubbles()
+                            if 0 <= b_idx < len(bubbles):
+                                bubbles[b_idx] = text
+                            else:
+                                bubbles.append(text)
+                            acc.custom_messages = bubbles
+                            acc.custom_message = "\n---\n".join(bubbles)
+                            await db_manager.save_account(acc)
+
+                            confirm_msg = (
+                                f"✅ <b>Updated Response Bubble #{b_idx + 1} for @{html.escape(acc.username or str(target_id))}!</b>\n\n"
+                                f"<blockquote>{html.escape(text)}</blockquote>"
+                            )
+                            kb = [
+                                [
+                                    {
+                                        "text": "💬 Bubble Manager",
                                         "callback_data": f"cust_msg_menu_{target_id}",
+                                    },
+                                    {
+                                        "text": "⬅️ Back to Settings",
+                                        "callback_data": f"acc_{target_id}",
                                     },
                                 ]
                             ]
@@ -1435,23 +1837,9 @@ async def run_bot_polling():
                                     "reply_markup": {"inline_keyboard": kb},
                                 },
                             )
-                            # Send live preview of the message
-                            preview_text = normalize_links_for_preview(acc.custom_message)
-                            await tg_api_call(
-                                "sendMessage",
-                                {
-                                    "chat_id": chat_id,
-                                    "text": preview_text,
-                                    "link_preview_options": {
-                                        "is_disabled": False,
-                                        "prefer_large_media": True,
-                                        "show_above_text": False,
-                                    },
-                                    "disable_web_page_preview": False,
-                                },
-                            )
                             continue
 
+                        # Awaiting trigger rule
                         elif action == "awaiting_trigger" and acc and ":" in text:
                             kw, resp_val = text.split(":", 1)
                             kw = kw.strip().lower()
@@ -1546,6 +1934,12 @@ async def lifespan(app: FastAPI):
         if kw_trig is None:
             kw_trig = not doc.get("trigger_all", False)
 
+        custom_msgs = doc.get("custom_messages") or []
+        if not custom_msgs and doc.get("custom_message"):
+            custom_msgs = split_message_bubbles(doc.get("custom_message"))
+        if not custom_msgs:
+            custom_msgs = [DEFAULT_CUSTOM_MESSAGE]
+
         acc = ConnectedAccount(
             connection_id=doc.get("connection_id", ""),
             user_id=uid,
@@ -1555,13 +1949,19 @@ async def lifespan(app: FastAPI):
             is_enabled=doc.get("is_enabled", True),
             keyword_triggers=kw_trig,
             trigger_all=not kw_trig,
+            quote_reply=doc.get("quote_reply", True),
             custom_message=doc.get("custom_message", DEFAULT_CUSTOM_MESSAGE),
+            custom_messages=custom_msgs,
             triggers_raw=doc.get("triggers_raw", DEFAULT_TRIGGERS_RAW),
             triggers=doc.get("triggers") or parse_triggers(DEFAULT_TRIGGERS_RAW),
             ai_fallback=doc.get("ai_fallback", True),
             model=doc.get("model", DEFAULT_MODEL),
             active=doc.get("active", True),
             processed_count=doc.get("processed_count", 0),
+            keyword_matches_count=doc.get("keyword_matches_count", 0),
+            reply_all_count=doc.get("reply_all_count", 0),
+            ai_fallbacks_count=doc.get("ai_fallbacks_count", 0),
+            recent_interactions=doc.get("recent_interactions", []),
             away_mode=doc.get("away_mode", False),
             away_timeout_minutes=doc.get("away_timeout_minutes", 5),
             last_owner_activity=doc.get("last_owner_activity"),
@@ -1633,9 +2033,11 @@ app = FastAPI(
 def render_dashboard(msg: str = "", err: str = "") -> str:
     """
     Generates a single-page responsive dark-mode HTML dashboard without external CDNs.
+    Includes dynamic multi-bubble manager and live customer interaction audit logs.
     """
     active_count = sum(1 for a in accounts.values() if a.active and a.can_reply)
     total_accounts = len(accounts)
+    total_dms_all = sum(a.processed_count for a in accounts.values())
 
     banner_html = ""
     if msg:
@@ -1685,6 +2087,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
             ai_checked = "checked" if acc.ai_fallback else ""
             away_checked = "checked" if acc.away_mode else ""
             kw_checked = "checked" if acc.keyword_triggers else ""
+            quote_checked = "checked" if acc.quote_reply else ""
             user_title = (
                 f"@{html.escape(acc.username)}"
                 if acc.username
@@ -1703,9 +2106,67 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                     presence_pill = f"Presence: <strong style='color:#94a3b8;'>Away ({int(idle_s / 60)}m ago)</strong>"
 
             if acc.keyword_triggers:
-                mode_pill = '<span class="stat-pill" style="border-color: rgba(74, 222, 128, 0.4); color: #4ade80;">Mode: <strong>Keywords (Conditions)</strong></span>'
+                mode_pill = '<span class="stat-pill" style="border-color: rgba(74, 222, 128, 0.4); color: #4ade80;">Mode: <strong>Keywords (Rules)</strong></span>'
             else:
-                mode_pill = '<span class="stat-pill" style="border-color: rgba(56, 189, 248, 0.4); color: #38bdf8;">Mode: <strong>Reply on All Msgs</strong></span>'
+                mode_pill = '<span class="stat-pill" style="border-color: rgba(56, 189, 248, 0.4); color: #38bdf8;">Mode: <strong>Reply to All DMs</strong></span>'
+
+            bubbles = acc.get_bubbles()
+
+            # Render dynamic response bubbles HTML
+            rendered_bubbles_html = ""
+            for idx, bubble_text in enumerate(bubbles, 1):
+                first_label = " (Quotes Customer)" if (idx == 1 and acc.quote_reply) else ""
+                rem_btn = (
+                    f'<button type="button" class="btn btn-danger btn-sm" style="padding: 2px 8px; font-size: 11px;" onclick="removeBubble(this, \'{user_id}\')">🗑️ Remove</button>'
+                    if len(bubbles) > 1
+                    else ""
+                )
+                rendered_bubbles_html += f"""
+                <div class="bubble-item" style="margin-bottom: 10px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                        <span class="bubble-title" style="font-size: 12px; font-weight: 600; color: #38bdf8;">Bubble #{idx}{first_label}</span>
+                        {rem_btn}
+                    </div>
+                    <textarea name="custom_bubbles" rows="3" class="form-control" style="min-height: 80px; font-size: 13px; line-height: 1.45;" placeholder="Enter message text or invite links (e.g. https://t.me/+...)">{html.escape(bubble_text)}</textarea>
+                </div>
+                """
+
+            # Render Recent Interactions Audit Log HTML
+            audit_log_html = ""
+            if not acc.recent_interactions:
+                audit_log_html = """
+                <div style="font-size: 12px; color: var(--text-muted); font-style: italic; padding: 10px; background: #0d121c; border-radius: 6px;">
+                    No customer interactions logged yet. Incoming DMs and replies will update here live!
+                </div>
+                """
+            else:
+                audit_log_html = '<div style="display: flex; flex-direction: column; gap: 8px; max-height: 220px; overflow-y: auto; padding-right: 4px;">'
+                for r in acc.recent_interactions[:5]:
+                    c_name = html.escape(str(r.get("customer_name") or r.get("customer_id") or "Customer"))
+                    in_text = html.escape(str(r.get("incoming_text", ""))[:70])
+                    out_text = html.escape(str(r.get("response_text", ""))[:80])
+                    ts_str = html.escape(str(r.get("timestamp", ""))[-12:])
+                    rtype = r.get("response_type", "")
+                    badge_style = "background: rgba(74, 222, 128, 0.15); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.3);" if "keyword" in rtype else ("background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);" if "all" in rtype else "background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3);")
+                    badge_name = "Keyword" if "keyword" in rtype else ("Reply-All" if "all" in rtype else "AI")
+                    audit_log_html += f"""
+                    <div style="background: #0d121c; border: 1px solid var(--border-color); border-radius: 6px; padding: 8px 10px; font-size: 12px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                            <strong style="color: var(--text-main);">👤 {c_name}</strong>
+                            <div style="display: flex; align-items: center; gap: 6px;">
+                                <span style="font-size: 10px; padding: 1px 6px; border-radius: 4px; {badge_style}">{badge_name}</span>
+                                <span style="font-size: 11px; color: var(--text-muted);">{ts_str}</span>
+                            </div>
+                        </div>
+                        <div style="color: #94a3b8; margin-bottom: 2px;">
+                            📥 <span style="color: #cbd5e1;">"{in_text}"</span>
+                        </div>
+                        <div style="color: #38bdf8;">
+                            📤 <span style="color: #e2e8f0;">"{out_text}"</span>
+                        </div>
+                    </div>
+                    """
+                audit_log_html += "</div>"
 
             cards_html += f"""
             <div class="card account-card">
@@ -1720,8 +2181,11 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                     </div>
                 </div>
 
-                <div class="stat-pill-row">
-                    <span class="stat-pill">DMs Auto-Responded: <strong>{acc.processed_count}</strong></span>
+                <div class="stat-pill-row" style="flex-wrap: wrap;">
+                    <span class="stat-pill">DMs Total: <strong>{acc.processed_count}</strong></span>
+                    <span class="stat-pill">🔑 Keywords: <strong>{acc.keyword_matches_count}</strong></span>
+                    <span class="stat-pill">💬 Reply-All: <strong>{acc.reply_all_count}</strong></span>
+                    <span class="stat-pill">🤖 AI: <strong>{acc.ai_fallbacks_count}</strong></span>
                     <span class="stat-pill">{presence_pill}</span>
                     {mode_pill}
                 </div>
@@ -1729,11 +2193,18 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 <form method="POST" action="/account/{user_id}/update" class="account-form">
                     <div class="form-group">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                            <label style="margin-bottom:0; font-weight: 600; color: var(--accent-blue);">💬 Customized Message (Reply to All Mode)</label>
+                            <label style="margin-bottom:0; font-weight: 600; color: var(--accent-blue);">💬 Multi-Response Bubbles (Sent sequentially)</label>
                             <span style="font-size: 11px; color: var(--text-muted);">Rich https://t.me/ previews</span>
                         </div>
-                        <textarea name="custom_message" rows="5" class="form-control" style="min-height: 120px; font-size: 13px; line-height: 1.45;" placeholder="Enter custom message or invite links (e.g. Join our group: https://t.me/+...). Sent to all messages when Keyword Trigger is OFF!">{html.escape(acc.custom_message)}</textarea>
-                        <div class="form-help">👉 <strong>Reply on All Mode:</strong> When Keyword Trigger is OFF, this message is sent to all incoming DMs (no matter what keyword). Supports rich Telegram cards for links.</div>
+
+                        <div id="bubbles-container-{user_id}">
+                            {rendered_bubbles_html}
+                        </div>
+
+                        <div style="display: flex; gap: 8px; margin-top: 6px; margin-bottom: 8px;">
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="addBubble('{user_id}')">➕ Add Response Bubble</button>
+                        </div>
+                        <div class="form-help">👉 <strong>Multiple Responses:</strong> The bot sends these message bubbles in sequence. Bubble #1 directly quotes/replies to the customer. Add or remove bubbles dynamically.</div>
                     </div>
 
                     <div class="form-group">
@@ -1741,20 +2212,28 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                             <label style="margin-bottom:0; font-weight: 600;">📝 Keyword Conditions & Replies (When Keyword Trigger is ON)</label>
                             <span style="font-size: 11px; color: var(--text-muted);">keyword:response (1 per line)</span>
                         </div>
-                        <textarea name="triggers" rows="5" class="form-control" style="min-height: 120px; font-size: 13px; font-family: monospace; line-height: 1.45;" placeholder="hello:Hello there!, pricing:Our plans start at $19/mo, group:Join here https://t.me/+...">{html.escape(acc.triggers_raw)}</textarea>
-                        <div class="form-help">👉 <strong>Keyword Conditions Mode:</strong> When Keyword Trigger is ON, matches different keywords for different replies (with rich preview cards). If no keyword matches, bot stays quiet.</div>
+                        <textarea name="triggers" rows="4" class="form-control" style="min-height: 100px; font-size: 13px; font-family: monospace; line-height: 1.45;" placeholder="hello:Hello there!, pricing:Our plans start at $19/mo, group:Join here https://t.me/+...">{html.escape(acc.triggers_raw)}</textarea>
+                        <div class="form-help">👉 <strong>Keyword Conditions Mode:</strong> Matches different keywords for different replies. Separate multiple bubble replies with <code>---</code> inside a trigger rule if desired.</div>
                     </div>
 
                     <div class="form-row" style="flex-wrap: wrap; margin-bottom: 16px;">
-                        <div class="form-group toggle-group" style="flex: 1; min-width: 115px;">
+                        <div class="form-group toggle-group" style="flex: 1; min-width: 100px;">
                             <label>Keyword Trigger</label>
                             <label class="switch">
                                 <input type="checkbox" name="keyword_triggers" value="on" {kw_checked}>
                                 <span class="slider"></span>
                             </label>
-                            <span style="font-size: 10px; color: {'#4ade80' if acc.keyword_triggers else '#38bdf8'}; margin-top: 3px;">{'ON = Conditions' if acc.keyword_triggers else 'OFF = Reply All'}</span>
+                            <span style="font-size: 10px; color: {'#4ade80' if acc.keyword_triggers else '#38bdf8'}; margin-top: 3px;">{'ON = Rules' if acc.keyword_triggers else 'OFF = Reply All'}</span>
                         </div>
                         <div class="form-group toggle-group" style="flex: 1; min-width: 95px;">
+                            <label>Quote Reply</label>
+                            <label class="switch">
+                                <input type="checkbox" name="quote_reply" value="on" {quote_checked}>
+                                <span class="slider"></span>
+                            </label>
+                            <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Quotes customer</span>
+                        </div>
+                        <div class="form-group toggle-group" style="flex: 1; min-width: 90px;">
                             <label>Smart Away</label>
                             <label class="switch">
                                 <input type="checkbox" name="away_mode" value="on" {away_checked}>
@@ -1762,7 +2241,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                             </label>
                             <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Auto-sleeps</span>
                         </div>
-                        <div class="form-group toggle-group" style="flex: 1; min-width: 95px;">
+                        <div class="form-group toggle-group" style="flex: 1; min-width: 90px;">
                             <label>AI Fallback</label>
                             <label class="switch">
                                 <input type="checkbox" name="ai_fallback" value="on" {ai_checked}>
@@ -1770,22 +2249,29 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                             </label>
                             <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">OpenRouter</span>
                         </div>
-                        <div class="form-group" style="flex: 2; min-width: 170px;">
+                        <div class="form-group" style="flex: 2; min-width: 160px;">
                             <label>AI Model String</label>
                             <input type="text" name="model" class="form-control" value="{html.escape(acc.model)}" placeholder="e.g. google/gemini-2.5-flash">
                         </div>
                     </div>
 
-                    <div class="card-footer">
+                    <div class="card-footer" style="margin-bottom: 14px;">
                         <button type="submit" class="btn btn-primary btn-full" style="padding: 12px; font-size: 14px; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 8px;">
                             💾 Save @{html.escape(acc.username or str(acc.user_id))} Settings & Messages
                         </button>
                     </div>
                 </form>
+
+                <div class="audit-section" style="margin-top: 6px; border-top: 1px solid var(--border-color); padding-top: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <span style="font-size: 12px; font-weight: 600; color: var(--text-muted);">📜 Recent Customer Interactions</span>
+                        <span style="font-size: 11px; color: var(--text-muted);">{len(acc.recent_interactions)} logged</span>
+                    </div>
+                    {audit_log_html}
+                </div>
             </div>
             """
 
-    # Global Bulk Config values (reference from first account or default)
     bulk_triggers = (
         list(accounts.values())[0].triggers_raw if accounts else DEFAULT_TRIGGERS_RAW
     )
@@ -2053,7 +2539,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
         }}
         textarea.form-control {{
             resize: vertical;
-            min-height: 120px;
+            min-height: 80px;
             font-family: inherit;
             line-height: 1.45;
             white-space: pre-wrap;
@@ -2223,6 +2709,42 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
             .toggle-group {{ align-items: flex-start; }}
         }}
     </style>
+    <script>
+        function addBubble(userId) {{
+            const container = document.getElementById('bubbles-container-' + userId);
+            if (!container) return;
+            const count = container.querySelectorAll('.bubble-item').length + 1;
+            const item = document.createElement('div');
+            item.className = 'bubble-item';
+            item.style.marginBottom = '10px';
+            item.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                    <span class="bubble-title" style="font-size: 12px; font-weight: 600; color: #38bdf8;">Bubble #${{count}}</span>
+                    <button type="button" class="btn btn-danger btn-sm" style="padding: 2px 8px; font-size: 11px;" onclick="removeBubble(this, '${{userId}}')">🗑️ Remove</button>
+                </div>
+                <textarea name="custom_bubbles" rows="3" class="form-control" style="min-height: 80px; font-size: 13px; line-height: 1.45;" placeholder="Enter message text or invite link (e.g. https://t.me/+...)"></textarea>
+            `;
+            container.appendChild(item);
+        }}
+
+        function removeBubble(btn, userId) {{
+            const container = document.getElementById('bubbles-container-' + userId);
+            if (!container) return;
+            const items = container.querySelectorAll('.bubble-item');
+            if (items.length <= 1) {{
+                alert("At least one response bubble is required!");
+                return;
+            }}
+            btn.closest('.bubble-item').remove();
+            const remaining = container.querySelectorAll('.bubble-item');
+            remaining.forEach((el, idx) => {{
+                const title = el.querySelector('.bubble-title');
+                if (title) {{
+                    title.innerText = 'Bubble #' + (idx + 1) + (idx === 0 ? ' (First Reply)' : '');
+                }}
+            }});
+        }}
+    </script>
 </head>
 <body>
     <div class="container">
@@ -2242,6 +2764,10 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 <div class="stat-chip">
                     <span>Connected Accounts:</span>
                     <span class="stat-value">{active_count} / {total_accounts} Active</span>
+                </div>
+                <div class="stat-chip">
+                    <span>Total DMs Responded:</span>
+                    <span class="stat-value">{total_dms_all}</span>
                 </div>
                 <div class="stat-chip">
                     <span>Database:</span>
@@ -2267,19 +2793,23 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 </span>
             </div>
             <div class="bulk-desc">
-                Overwrite trigger keywords, custom auto-reply messages, and settings across ALL connected accounts in a single click.
+                Overwrite trigger keywords, response bubbles, and settings across ALL connected accounts in a single click.
             </div>
             <form method="POST" action="/bulk-update">
                 <div class="form-group">
-                    <label style="font-weight: 600; color: var(--accent-blue);">💬 Bulk Custom Message (Sent to all DMs when Keyword Trigger is OFF)</label>
-                    <textarea name="custom_message" rows="4" class="form-control" style="min-height: 100px;" placeholder="Hello! Join our group: https://t.me/+...">{html.escape(bulk_custom_msg)}</textarea>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                        <label style="margin-bottom:0; font-weight: 600; color: var(--accent-blue);">💬 Bulk Response Bubbles (Separate multiple bubbles with ---)</label>
+                        <span style="font-size: 11px; color: var(--text-muted);">Rich https://t.me/ previews</span>
+                    </div>
+                    <textarea name="custom_message" rows="4" class="form-control" style="min-height: 100px;" placeholder="Bubble 1: Hello!\n---\nBubble 2: Join our group: https://t.me/+...\n---\nBubble 3: Let us know if you need help!">{html.escape(bulk_custom_msg)}</textarea>
+                    <div class="form-help">👉 Enter message text or divide multiple bubbles using <code>---</code> on a new line. Applied to all connected accounts!</div>
                 </div>
                 <div class="form-group">
                     <label style="font-weight: 600;">📝 Bulk Keyword Conditions (keyword:response text, 1 per line)</label>
                     <textarea name="triggers" rows="4" class="form-control" style="min-height: 100px;" placeholder="hello:Hi there!, pricing:Our pricing is $10/mo, group:https://t.me/+...">{html.escape(bulk_triggers)}</textarea>
                 </div>
                 <div class="form-row" style="flex-wrap: wrap; margin-bottom: 16px;">
-                    <div class="form-group toggle-group" style="flex: 1; min-width: 115px;">
+                    <div class="form-group toggle-group" style="flex: 1; min-width: 105px;">
                         <label>Keyword Trigger</label>
                         <label class="switch">
                             <input type="checkbox" name="keyword_triggers" value="on" checked>
@@ -2288,6 +2818,14 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                         <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">ON=Rules, OFF=All</span>
                     </div>
                     <div class="form-group toggle-group" style="flex: 1; min-width: 95px;">
+                        <label>Quote Reply</label>
+                        <label class="switch">
+                            <input type="checkbox" name="quote_reply" value="on" checked>
+                            <span class="slider"></span>
+                        </label>
+                        <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Quotes customer</span>
+                    </div>
+                    <div class="form-group toggle-group" style="flex: 1; min-width: 90px;">
                         <label>Smart Away</label>
                         <label class="switch">
                             <input type="checkbox" name="away_mode" value="on">
@@ -2295,7 +2833,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                         </label>
                         <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Auto-sleeps</span>
                     </div>
-                    <div class="form-group toggle-group" style="flex: 1; min-width: 95px;">
+                    <div class="form-group toggle-group" style="flex: 1; min-width: 90px;">
                         <label>AI Fallback</label>
                         <label class="switch">
                             <input type="checkbox" name="ai_fallback" value="on" checked>
@@ -2303,7 +2841,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                         </label>
                         <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">OpenRouter</span>
                     </div>
-                    <div class="form-group" style="flex: 2; min-width: 170px;">
+                    <div class="form-group" style="flex: 2; min-width: 160px;">
                         <label>AI Model String for All Accounts</label>
                         <input type="text" name="model" class="form-control" value="{html.escape(bulk_model)}" placeholder="e.g. google/gemini-2.5-flash">
                     </div>
@@ -2374,6 +2912,10 @@ async def health_check():
     is_bot_online = bool(polling_task and not polling_task.done() and bot_info.get("id"))
     active_count = sum(1 for a in accounts.values() if a.active and a.can_reply)
     total_triggers = sum(len(a.triggers) for a in accounts.values())
+    total_dms = sum(a.processed_count for a in accounts.values())
+    total_kw = sum(a.keyword_matches_count for a in accounts.values())
+    total_all = sum(a.reply_all_count for a in accounts.values())
+    total_ai = sum(a.ai_fallbacks_count for a in accounts.values())
 
     health_payload = {
         "status": "UP" if is_bot_online or not BOT_TOKEN else "DEGRADED",
@@ -2391,7 +2933,12 @@ async def health_check():
         "stats": {
             "connected_accounts": len(accounts),
             "active_auto_responders": active_count,
+            "total_dms_processed": total_dms,
+            "keyword_matches_count": total_kw,
+            "reply_all_count": total_all,
+            "ai_fallbacks_count": total_ai,
             "away_mode_active": sum(1 for a in accounts.values() if a.away_mode),
+            "quote_reply_active": sum(1 for a in accounts.values() if a.quote_reply),
             "keyword_triggers_active": sum(1 for a in accounts.values() if a.keyword_triggers),
             "reply_all_active": sum(1 for a in accounts.values() if not a.keyword_triggers),
             "total_triggers_configured": total_triggers,
@@ -2410,18 +2957,24 @@ app.include_router(health_router)
 @app.post("/bulk-update")
 async def bulk_update_accounts(request: Request):
     """
-    Overwrites trigger rules, custom message, trigger_all state, AI fallback state, and model string for all connected accounts.
+    Overwrites trigger rules, multi-response bubbles, and settings for all connected accounts.
     """
     body = (await request.body()).decode("utf-8")
     data = urllib.parse.parse_qs(body)
 
     triggers_raw = data.get("triggers", [""])[0].strip()
-    custom_message = (
-        data.get("custom_message", [DEFAULT_CUSTOM_MESSAGE])[0].strip()
-        or DEFAULT_CUSTOM_MESSAGE
-    )
+    raw_custom = data.get("custom_message", [DEFAULT_CUSTOM_MESSAGE])[0].strip()
+    bubble_list = [b.strip() for b in data.get("custom_bubbles", []) if b.strip()]
+    if not bubble_list:
+        if raw_custom:
+            bubble_list = split_message_bubbles(raw_custom)
+        else:
+            bubble_list = [DEFAULT_CUSTOM_MESSAGE]
+
+    custom_message = "\n---\n".join(bubble_list)
     keyword_triggers = "keyword_triggers" in data
     trigger_all = not keyword_triggers
+    quote_reply = "quote_reply" in data
     ai_fallback = "ai_fallback" in data
     away_mode = "away_mode" in data
     model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
@@ -2430,9 +2983,11 @@ async def bulk_update_accounts(request: Request):
     for acc in accounts.values():
         acc.triggers_raw = triggers_raw
         acc.triggers = parsed_rules
+        acc.custom_messages = list(bubble_list)
         acc.custom_message = custom_message
         acc.keyword_triggers = keyword_triggers
         acc.trigger_all = trigger_all
+        acc.quote_reply = quote_reply
         acc.ai_fallback = ai_fallback
         acc.away_mode = away_mode
         acc.model = model
@@ -2440,7 +2995,8 @@ async def bulk_update_accounts(request: Request):
         await db_manager.save_account(acc)
 
     logger.info(
-        f"Bulk update executed: applied {len(parsed_rules)} triggers, keyword_triggers={keyword_triggers}, AI fallback={ai_fallback}, model='{model}' across {len(accounts)} accounts."
+        f"Bulk update executed: applied {len(parsed_rules)} triggers, {len(bubble_list)} bubble(s), "
+        f"quote_reply={quote_reply}, keyword_triggers={keyword_triggers}, AI fallback={ai_fallback}, model='{model}' across {len(accounts)} accounts."
     )
     return RedirectResponse(
         url="/?msg=All+connected+accounts+synchronized+successfully", status_code=303
@@ -2450,7 +3006,7 @@ async def bulk_update_accounts(request: Request):
 @app.post("/account/{user_id}/update")
 async def update_account_config(user_id: int, request: Request):
     """
-    Updates configuration and messages for an individual connected business account.
+    Updates configuration, multi-response bubbles, and toggles for an individual connected business account.
     """
     if user_id not in accounts:
         return RedirectResponse(
@@ -2463,12 +3019,21 @@ async def update_account_config(user_id: int, request: Request):
 
     acc.triggers_raw = data.get("triggers", [""])[0].strip()
     acc.triggers = parse_triggers(acc.triggers_raw)
-    acc.custom_message = (
-        data.get("custom_message", [DEFAULT_CUSTOM_MESSAGE])[0].strip()
-        or DEFAULT_CUSTOM_MESSAGE
-    )
+
+    bubble_list = [b.strip() for b in data.get("custom_bubbles", []) if b.strip()]
+    if not bubble_list:
+        raw_msg = data.get("custom_message", [""])[0].strip()
+        if raw_msg:
+            bubble_list = split_message_bubbles(raw_msg)
+        else:
+            bubble_list = [DEFAULT_CUSTOM_MESSAGE]
+
+    acc.custom_messages = bubble_list
+    acc.custom_message = "\n---\n".join(bubble_list)
+
     acc.keyword_triggers = "keyword_triggers" in data
     acc.trigger_all = not acc.keyword_triggers
+    acc.quote_reply = "quote_reply" in data
     acc.ai_fallback = "ai_fallback" in data
     acc.away_mode = "away_mode" in data
     acc.model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
@@ -2477,7 +3042,9 @@ async def update_account_config(user_id: int, request: Request):
     await db_manager.save_account(acc)
 
     logger.info(
-        f"[Account @{acc.username or user_id}] Updated: keyword_triggers={acc.keyword_triggers}, {len(acc.triggers)} triggers, AI fallback={acc.ai_fallback}, model='{acc.model}'"
+        f"[Account @{acc.username or user_id}] Updated: keyword_triggers={acc.keyword_triggers}, "
+        f"quote_reply={acc.quote_reply}, bubbles={len(acc.custom_messages)}, {len(acc.triggers)} triggers, "
+        f"AI fallback={acc.ai_fallback}, model='{acc.model}'"
     )
     return RedirectResponse(
         url=f"/?msg=Settings+and+messages+saved+successfully+for+@{html.escape(acc.username or str(user_id))}",
