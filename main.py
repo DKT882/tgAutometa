@@ -67,6 +67,12 @@ DEFAULT_TRIGGERS_RAW = (
     "support:You can reach out to our support team at support@example.com."
 )
 
+# Default custom auto-reply message (supports plain text and rich link preview cards)
+DEFAULT_CUSTOM_MESSAGE = (
+    os.getenv("DEFAULT_CUSTOM_MESSAGE")
+    or "Hello! Thanks for connecting. How can I assist you today?"
+).strip()
+
 # User session state for interactive Telegram DM Wizard
 # e.g., {user_id: {"action": "awaiting_trigger", "target_account_id": 123456}}
 user_wizard_state: Dict[int, Dict[str, Any]] = {}
@@ -191,6 +197,8 @@ class DatabaseManager:
                 "away_mode": account.away_mode,
                 "away_timeout_minutes": account.away_timeout_minutes,
                 "last_owner_activity": account.last_owner_activity,
+                "trigger_all": account.trigger_all,
+                "custom_message": account.custom_message,
                 "triggers_raw": account.triggers_raw,
                 "triggers": account.triggers,
                 "ai_fallback": account.ai_fallback,
@@ -360,6 +368,8 @@ class ConnectedAccount:
     first_name: str = ""
     can_reply: bool = True
     is_enabled: bool = True
+    trigger_all: bool = False
+    custom_message: str = DEFAULT_CUSTOM_MESSAGE
     triggers_raw: str = DEFAULT_TRIGGERS_RAW
     triggers: Dict[str, str] = field(default_factory=dict)
     ai_fallback: bool = True
@@ -416,20 +426,35 @@ async def send_typing_indicator(business_connection_id: str, chat_id: int):
     )
 
 
+def normalize_links_for_preview(text: str) -> str:
+    """
+    Ensures standalone 't.me/...' or 'telegram.me/...' links have 'https://' prefix
+    so Telegram Bot API reliably renders the rich preview card.
+    """
+    import re
+    return re.sub(r'(?<!https://)(?<!http://)\b((?:t|telegram)\.me/[^\s]+)', r'https://\1', text)
+
+
 async def send_business_message(
     business_connection_id: str, chat_id: int, text: str
 ) -> bool:
     """
     Send a message in a private DM on behalf of the connected business account.
+    Guarantees rich preview cards (image, title, join group button) for Telegram invite links.
     """
-    result = await tg_api_call(
-        "sendMessage",
-        {
-            "business_connection_id": business_connection_id,
-            "chat_id": chat_id,
-            "text": text,
+    formatted_text = normalize_links_for_preview(text)
+    payload = {
+        "business_connection_id": business_connection_id,
+        "chat_id": chat_id,
+        "text": formatted_text,
+        "link_preview_options": {
+            "is_disabled": False,
+            "prefer_large_media": True,
+            "show_above_text": False,
         },
-    )
+        "disable_web_page_preview": False,
+    }
+    result = await tg_api_call("sendMessage", payload)
     return result is not None
 
 
@@ -589,7 +614,34 @@ async def process_business_message(message: dict):
         return
 
     # -----------------------------------------------------------------------
-    # Step B: AI Chatbot Fallback Mode via OpenRouter
+    # Step B: Trigger on All Messages Mode (Custom Auto-Reply Message)
+    # -----------------------------------------------------------------------
+    if account.trigger_all:
+        reply_content = account.custom_message or DEFAULT_CUSTOM_MESSAGE
+        logger.info(
+            f"[Account @{account.username or account.user_id}] Trigger-on-All activated. Sending customized reply."
+        )
+        success = await send_business_message(
+            account.connection_id, chat_id, reply_content
+        )
+        if success:
+            account.processed_count += 1
+            asyncio.create_task(db_manager.increment_processed_count(account.user_id))
+            asyncio.create_task(
+                db_manager.log_interaction(
+                    account_id=account.user_id,
+                    customer_id=sender_id,
+                    customer_name=customer_name,
+                    incoming_text=raw_text,
+                    response_type="trigger_all",
+                    response_text=reply_content,
+                    matched_keyword="[ALL_MESSAGES]",
+                )
+            )
+        return
+
+    # -----------------------------------------------------------------------
+    # Step C: AI Chatbot Fallback Mode via OpenRouter
     # -----------------------------------------------------------------------
     if account.ai_fallback:
         if not OPENROUTER_API_KEY:
@@ -749,14 +801,19 @@ def build_accounts_menu() -> tuple[str, list]:
 
 def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
     """
-    Screen 2: Detailed Account Settings panel (inspired by image 2).
+    Screen 2: Detailed Account Settings panel (inspired by image 1 & 2).
     """
     status_text = "Active ✅ (Replying)" if (acc.active and acc.can_reply) else "Paused ⏸️"
     ai_status = "✅ ENABLED" if acc.ai_fallback else "❌ DISABLED"
     away_status = (
-        "✅ ENABLED (Deactivates when you are online)"
+        "✅ ENABLED (Deactivates when online)"
         if acc.away_mode
         else "❌ DISABLED (Always active)"
+    )
+    trig_all_status = (
+        "✅ ENABLED (Replies to all DMs)"
+        if acc.trigger_all
+        else "❌ DISABLED (Keyword rules only)"
     )
 
     if not acc.last_owner_activity:
@@ -771,6 +828,11 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
             presence_str = f"💤 OFFLINE (Idle for {int(idle_s / 60)}m)"
 
     triggers_count = len(acc.triggers)
+    custom_snippet = (
+        (acc.custom_message[:40] + "...")
+        if len(acc.custom_message) > 40
+        else acc.custom_message
+    )
 
     text = (
         f"<b>SETTINGS</b>\n"
@@ -778,6 +840,8 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
         f"• <b>Status:</b> {status_text}\n"
         f"• <b>Owner Presence:</b> {presence_str}\n"
         f"• <b>Smart Away Mode:</b> {away_status}\n"
+        f"• <b>Trigger on All Msgs:</b> {trig_all_status}\n"
+        f"• <b>Custom Message:</b> <i>{html.escape(custom_snippet)}</i>\n"
         f"• <b>AI Fallback:</b> {ai_status}\n"
         f"• <b>AI Model:</b> <code>{html.escape(acc.model)}</code>\n"
         f"• <b>Predefined Triggers:</b> {triggers_count} active rule(s)\n"
@@ -788,6 +852,7 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
     ai_btn_text = "🤖 AI Fallback: ON" if acc.ai_fallback else "🤖 AI Fallback: OFF"
     active_btn_text = "⚡ Status: ACTIVE" if acc.active else "⚡ Status: PAUSED"
     away_btn_text = "🌙 Away Mode: ON" if acc.away_mode else "🌙 Away Mode: OFF"
+    trig_all_btn_text = "🎯 Trigger All: ON" if acc.trigger_all else "🎯 Trigger All: OFF"
 
     keyboard = [
         [
@@ -800,6 +865,10 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
                 "text": f"⏱️ Timeout: {acc.away_timeout_minutes}m",
                 "callback_data": f"away_time_{acc.user_id}",
             },
+        ],
+        [
+            {"text": trig_all_btn_text, "callback_data": f"tog_trig_all_{acc.user_id}"},
+            {"text": "💬 Customize Message", "callback_data": f"cust_msg_menu_{acc.user_id}"},
         ],
         [
             {"text": "📝 View Triggers", "callback_data": f"view_trig_{acc.user_id}"},
@@ -984,6 +1053,129 @@ async def handle_callback_query(cq: dict):
             await answer(f"Away threshold set to {next_delay} minutes of inactivity.")
             text, kb = build_account_settings_menu(acc)
             await edit(text, kb)
+        return
+
+    # Toggle Trigger All Messages Mode
+    if data.startswith("tog_trig_all_"):
+        uid = int(data.split("_")[3])
+        acc = accounts.get(uid)
+        if acc:
+            acc.trigger_all = not acc.trigger_all
+            await db_manager.save_account(acc)
+            status_msg = (
+                "🎯 Trigger on All Messages ENABLED: Bot will automatically reply to every incoming DM with your customized message."
+                if acc.trigger_all
+                else "🎯 Trigger on All Messages DISABLED: Bot will only reply when a keyword trigger matches."
+            )
+            await answer(status_msg, alert=True)
+            text, kb = build_account_settings_menu(acc)
+            await edit(text, kb)
+        return
+
+    # Customize Message Submenu
+    if data.startswith("cust_msg_menu_"):
+        uid = int(data.split("_")[3])
+        acc = accounts.get(uid)
+        if not acc:
+            return
+        cust_text = (
+            f"<b>💬 CUSTOMIZE AUTO-REPLY MESSAGE</b>\n"
+            f"<b>Account:</b> @{html.escape(acc.username or str(uid))} ({html.escape(acc.first_name)})\n\n"
+            f"<b>Active Message:</b>\n"
+            f"<blockquote>{html.escape(acc.custom_message)}</blockquote>\n\n"
+            f"💡 <b>Tips & Link Preview Support:</b>\n"
+            f"• You can put text, emojis, and group/channel invite links (e.g. <code>https://t.me/+...</code>).\n"
+            f"• Telegram automatically generates the rich preview card with group photo and Join/View button (matching Image 2)!\n"
+            f"• Tap <b>'👁️ Test Link Preview'</b> below to test how it looks in chat right now."
+        )
+        kb = [
+            [
+                {"text": "✏️ Edit Custom Message", "callback_data": f"edit_cust_msg_{uid}"},
+                {"text": "👁️ Test Link Preview", "callback_data": f"test_preview_{uid}"},
+            ],
+            [
+                {"text": "🔄 Reset Default", "callback_data": f"reset_cust_msg_{uid}"},
+                {"text": "⬅️ Back to Settings", "callback_data": f"acc_{uid}"},
+            ],
+        ]
+        await edit(cust_text, kb)
+        await answer()
+        return
+
+    # Edit Custom Message Prompt
+    if data.startswith("edit_cust_msg_"):
+        uid = int(data.split("_")[3])
+        acc = accounts.get(uid)
+        if not acc:
+            return
+        user_wizard_state[from_user_id] = {
+            "action": "awaiting_custom_message",
+            "target_account_id": uid,
+        }
+        prompt_text = (
+            f"<b>✏️ Edit Custom Reply Message for @{html.escape(acc.username or str(uid))}</b>\n\n"
+            f"Send your new custom reply message in your next chat message.\n\n"
+            f"<b>Example (Text + Invite Link):</b>\n"
+            f"<code>Hello! Thanks for reaching out. Join our exclusive group:\nhttps://t.me/+G2ltaftHIqswMGU1</code>\n\n"
+            f"<i>Telegram will automatically attach the rich link preview card!</i>"
+        )
+        kb = [[{"text": "⬅️ Cancel", "callback_data": f"cust_msg_menu_{uid}"}]]
+        await edit(prompt_text, kb)
+        await answer()
+        return
+
+    # Test Link Preview in User's DM
+    if data.startswith("test_preview_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if not acc:
+            return
+        await answer("Sending preview card below... 👇")
+        preview_text = normalize_links_for_preview(acc.custom_message)
+        await tg_api_call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": preview_text,
+                "link_preview_options": {
+                    "is_disabled": False,
+                    "prefer_large_media": True,
+                    "show_above_text": False,
+                },
+                "disable_web_page_preview": False,
+            },
+        )
+        return
+
+    # Reset Custom Message to Default
+    if data.startswith("reset_cust_msg_"):
+        uid = int(data.split("_")[3])
+        acc = accounts.get(uid)
+        if acc:
+            acc.custom_message = DEFAULT_CUSTOM_MESSAGE
+            await db_manager.save_account(acc)
+            await answer("Reset to default auto-reply message.", alert=True)
+            cust_text = (
+                f"<b>💬 CUSTOMIZE AUTO-REPLY MESSAGE</b>\n"
+                f"<b>Account:</b> @{html.escape(acc.username or str(uid))} ({html.escape(acc.first_name)})\n\n"
+                f"<b>Active Message:</b>\n"
+                f"<blockquote>{html.escape(acc.custom_message)}</blockquote>\n\n"
+                f"💡 <b>Tips & Link Preview Support:</b>\n"
+                f"• You can put text, emojis, and group/channel invite links (e.g. <code>https://t.me/+...</code>).\n"
+                f"• Telegram automatically generates the rich preview card with group photo and Join/View button!\n"
+                f"• Tap <b>'👁️ Test Link Preview'</b> below to test how it looks in chat right now."
+            )
+            kb = [
+                [
+                    {"text": "✏️ Edit Custom Message", "callback_data": f"edit_cust_msg_{uid}"},
+                    {"text": "👁️ Test Link Preview", "callback_data": f"test_preview_{uid}"},
+                ],
+                [
+                    {"text": "🔄 Reset Default", "callback_data": f"reset_cust_msg_{uid}"},
+                    {"text": "⬅️ Back to Settings", "callback_data": f"acc_{uid}"},
+                ],
+            ]
+            await edit(cust_text, kb)
         return
 
     # Pick Model Menu
@@ -1194,43 +1386,89 @@ async def run_bot_polling():
                     from_user_id = from_user.get("id")
                     text = (msg.get("text") or "").strip()
 
-                    # Handle Wizard Text Input (e.g. adding a trigger rule)
+                    # Handle Wizard Text Input (e.g. adding a trigger rule or editing custom message)
                     if from_user_id in user_wizard_state:
                         state = user_wizard_state.pop(from_user_id)
-                        if state.get("action") == "awaiting_trigger":
-                            target_id = state.get("target_account_id")
-                            acc = accounts.get(target_id)
-                            if acc and ":" in text:
-                                kw, resp_val = text.split(":", 1)
-                                kw = kw.strip().lower()
-                                resp_val = resp_val.strip()
-                                if kw and resp_val:
-                                    acc.triggers[kw] = resp_val
-                                    acc.triggers_raw += f",\n{kw}:{resp_val}"
-                                    await db_manager.save_account(acc)
-                                    confirm = (
-                                        f"✅ <b>Trigger Saved!</b>\n\n"
-                                        f"Keyword: <code>{html.escape(kw)}</code>\n"
-                                        f"Reply: <i>{html.escape(resp_val)}</i>"
-                                    )
-                                    kb = [
-                                        [
-                                            {
-                                                "text": "⬅️ Back to Settings",
-                                                "callback_data": f"acc_{target_id}",
-                                            }
-                                        ]
-                                    ]
-                                    await tg_api_call(
-                                        "sendMessage",
+                        action = state.get("action")
+                        target_id = state.get("target_account_id")
+                        acc = accounts.get(target_id)
+
+                        if action == "awaiting_custom_message" and acc and text:
+                            acc.custom_message = text
+                            await db_manager.save_account(acc)
+                            confirm_msg = (
+                                f"✅ <b>Custom Message Saved for @{html.escape(acc.username or str(target_id))}!</b>\n\n"
+                                f"Below is how your message will appear in private DMs (with rich link preview):"
+                            )
+                            kb = [
+                                [
+                                    {
+                                        "text": "⬅️ Back to Settings",
+                                        "callback_data": f"acc_{target_id}",
+                                    },
+                                    {
+                                        "text": "💬 Custom Message Menu",
+                                        "callback_data": f"cust_msg_menu_{target_id}",
+                                    },
+                                ]
+                            ]
+                            await tg_api_call(
+                                "sendMessage",
+                                {
+                                    "chat_id": chat_id,
+                                    "text": confirm_msg,
+                                    "parse_mode": "HTML",
+                                    "reply_markup": {"inline_keyboard": kb},
+                                },
+                            )
+                            # Send live preview of the message
+                            preview_text = normalize_links_for_preview(acc.custom_message)
+                            await tg_api_call(
+                                "sendMessage",
+                                {
+                                    "chat_id": chat_id,
+                                    "text": preview_text,
+                                    "link_preview_options": {
+                                        "is_disabled": False,
+                                        "prefer_large_media": True,
+                                        "show_above_text": False,
+                                    },
+                                    "disable_web_page_preview": False,
+                                },
+                            )
+                            continue
+
+                        elif action == "awaiting_trigger" and acc and ":" in text:
+                            kw, resp_val = text.split(":", 1)
+                            kw = kw.strip().lower()
+                            resp_val = resp_val.strip()
+                            if kw and resp_val:
+                                acc.triggers[kw] = resp_val
+                                acc.triggers_raw += f",\n{kw}:{resp_val}"
+                                await db_manager.save_account(acc)
+                                confirm = (
+                                    f"✅ <b>Trigger Saved!</b>\n\n"
+                                    f"Keyword: <code>{html.escape(kw)}</code>\n"
+                                    f"Reply: <i>{html.escape(resp_val)}</i>"
+                                )
+                                kb = [
+                                    [
                                         {
-                                            "chat_id": chat_id,
-                                            "text": confirm,
-                                            "parse_mode": "HTML",
-                                            "reply_markup": {"inline_keyboard": kb},
-                                        },
-                                    )
-                                    continue
+                                            "text": "⬅️ Back to Settings",
+                                            "callback_data": f"acc_{target_id}",
+                                        }
+                                    ]
+                                ]
+                                await tg_api_call(
+                                    "sendMessage",
+                                    {
+                                        "chat_id": chat_id,
+                                        "text": confirm,
+                                        "parse_mode": "HTML",
+                                        "reply_markup": {"inline_keyboard": kb},
+                                    },
+                                )
+                                continue
 
                     # Commands
                     if text.startswith(("/start", "/settings", "/menu")):
@@ -1297,6 +1535,8 @@ async def lifespan(app: FastAPI):
             first_name=doc.get("first_name", ""),
             can_reply=doc.get("can_reply", True),
             is_enabled=doc.get("is_enabled", True),
+            trigger_all=doc.get("trigger_all", False),
+            custom_message=doc.get("custom_message", DEFAULT_CUSTOM_MESSAGE),
             triggers_raw=doc.get("triggers_raw", DEFAULT_TRIGGERS_RAW),
             triggers=doc.get("triggers") or parse_triggers(DEFAULT_TRIGGERS_RAW),
             ai_fallback=doc.get("ai_fallback", True),
@@ -1425,6 +1665,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
 
             ai_checked = "checked" if acc.ai_fallback else ""
             away_checked = "checked" if acc.away_mode else ""
+            trig_all_checked = "checked" if acc.trigger_all else ""
             user_title = (
                 f"@{html.escape(acc.username)}"
                 if acc.username
@@ -1463,34 +1704,57 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
 
                 <form method="POST" action="/account/{user_id}/update" class="account-form">
                     <div class="form-group">
-                        <label>Predefined Triggers (comma or newline separated: keyword:response)</label>
-                        <textarea name="triggers" rows="3" class="form-control" placeholder="keyword:response text, ...">{html.escape(acc.triggers_raw)}</textarea>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                            <label style="margin-bottom:0; font-weight: 600; color: var(--accent-blue);">💬 Customized Auto-Reply Message (Text + Links)</label>
+                            <span style="font-size: 11px; color: var(--text-muted);">Rich https://t.me/ previews</span>
+                        </div>
+                        <textarea name="custom_message" rows="5" class="form-control" style="min-height: 120px; font-size: 13px; line-height: 1.45;" placeholder="Enter custom auto-reply or invite links (e.g. Join our group: https://t.me/+...). Telegram will render the preview card automatically!">{html.escape(acc.custom_message)}</textarea>
+                        <div class="form-help">👉 Enter plain text and/or channel/group links (e.g. <code>https://t.me/+...</code>). Telegram renders the photo, description, and "View Group" button automatically.</div>
                     </div>
 
-                    <div class="form-row">
-                        <div class="form-group" style="flex: 2;">
-                            <label>AI Model String (OpenRouter)</label>
-                            <input type="text" name="model" class="form-control" value="{html.escape(acc.model)}" placeholder="e.g. google/gemini-2.5-flash">
+                    <div class="form-group">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                            <label style="margin-bottom:0; font-weight: 600;">📝 Predefined Triggers (keyword:response)</label>
+                            <span style="font-size: 11px; color: var(--text-muted);">Comma or newline separated</span>
                         </div>
-                        <div class="form-group toggle-group" style="flex: 1;">
-                            <label>AI Fallback</label>
+                        <textarea name="triggers" rows="5" class="form-control" style="min-height: 120px; font-size: 13px; font-family: monospace; line-height: 1.45;" placeholder="keyword:response text, ...">{html.escape(acc.triggers_raw)}</textarea>
+                    </div>
+
+                    <div class="form-row" style="flex-wrap: wrap; margin-bottom: 16px;">
+                        <div class="form-group toggle-group" style="flex: 1; min-width: 105px;">
+                            <label>Trigger All</label>
                             <label class="switch">
-                                <input type="checkbox" name="ai_fallback" value="on" {ai_checked}>
+                                <input type="checkbox" name="trigger_all" value="on" {trig_all_checked}>
                                 <span class="slider"></span>
                             </label>
+                            <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Auto-reply all</span>
                         </div>
-                        <div class="form-group toggle-group" style="flex: 1;">
-                            <label>Away Mode</label>
+                        <div class="form-group toggle-group" style="flex: 1; min-width: 95px;">
+                            <label>Smart Away</label>
                             <label class="switch">
                                 <input type="checkbox" name="away_mode" value="on" {away_checked}>
                                 <span class="slider"></span>
                             </label>
                             <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Auto-sleeps</span>
                         </div>
+                        <div class="form-group toggle-group" style="flex: 1; min-width: 95px;">
+                            <label>AI Fallback</label>
+                            <label class="switch">
+                                <input type="checkbox" name="ai_fallback" value="on" {ai_checked}>
+                                <span class="slider"></span>
+                            </label>
+                            <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">OpenRouter</span>
+                        </div>
+                        <div class="form-group" style="flex: 2; min-width: 170px;">
+                            <label>AI Model String</label>
+                            <input type="text" name="model" class="form-control" value="{html.escape(acc.model)}" placeholder="e.g. google/gemini-2.5-flash">
+                        </div>
                     </div>
 
                     <div class="card-footer">
-                        <button type="submit" class="btn btn-secondary btn-full">Save @{html.escape(acc.username or str(acc.user_id))} Settings</button>
+                        <button type="submit" class="btn btn-primary btn-full" style="padding: 12px; font-size: 14px; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                            💾 Save @{html.escape(acc.username or str(acc.user_id))} Settings & Messages
+                        </button>
                     </div>
                 </form>
             </div>
@@ -1499,6 +1763,9 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
     # Global Bulk Config values (reference from first account or default)
     bulk_triggers = (
         list(accounts.values())[0].triggers_raw if accounts else DEFAULT_TRIGGERS_RAW
+    )
+    bulk_custom_msg = (
+        list(accounts.values())[0].custom_message if accounts else DEFAULT_CUSTOM_MESSAGE
     )
     bulk_model = list(accounts.values())[0].model if accounts else DEFAULT_MODEL
 
@@ -1761,7 +2028,18 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
         }}
         textarea.form-control {{
             resize: vertical;
-            min-height: 70px;
+            min-height: 120px;
+            font-family: inherit;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }}
+        .form-help {{
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-top: 4px;
+            margin-bottom: 8px;
+            line-height: 1.4;
         }}
         .toggle-group {{
             display: flex;
@@ -1964,34 +2242,48 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 </span>
             </div>
             <div class="bulk-desc">
-                Overwrite trigger keywords, AI fallback switches, and AI model choices across ALL connected accounts in a single click.
+                Overwrite trigger keywords, custom auto-reply messages, and settings across ALL connected accounts in a single click.
             </div>
             <form method="POST" action="/bulk-update">
                 <div class="form-group">
-                    <label>Bulk Trigger Rules (keyword:response text, separated by commas or newlines)</label>
-                    <textarea name="triggers" rows="2" class="form-control" placeholder="hello:Hi there!, pricing:Our pricing is $10/mo">{html.escape(bulk_triggers)}</textarea>
+                    <label style="font-weight: 600; color: var(--accent-blue);">💬 Bulk Custom Auto-Reply Message (with link preview support for https://t.me/...)</label>
+                    <textarea name="custom_message" rows="4" class="form-control" style="min-height: 100px;" placeholder="Hello! Join our group: https://t.me/+...">{html.escape(bulk_custom_msg)}</textarea>
                 </div>
-                <div class="form-row">
-                    <div class="form-group" style="flex: 2;">
-                        <label>AI Model String for All Accounts</label>
-                        <input type="text" name="model" class="form-control" value="{html.escape(bulk_model)}" placeholder="e.g. google/gemini-2.5-flash">
-                    </div>
-                    <div class="form-group toggle-group" style="flex: 1;">
-                        <label>AI Fallback Mode</label>
+                <div class="form-group">
+                    <label style="font-weight: 600;">📝 Bulk Trigger Rules (keyword:response text, separated by commas or newlines)</label>
+                    <textarea name="triggers" rows="4" class="form-control" style="min-height: 100px;" placeholder="hello:Hi there!, pricing:Our pricing is $10/mo">{html.escape(bulk_triggers)}</textarea>
+                </div>
+                <div class="form-row" style="flex-wrap: wrap; margin-bottom: 16px;">
+                    <div class="form-group toggle-group" style="flex: 1; min-width: 105px;">
+                        <label>Trigger All</label>
                         <label class="switch">
-                            <input type="checkbox" name="ai_fallback" value="on" checked>
+                            <input type="checkbox" name="trigger_all" value="on">
                             <span class="slider"></span>
                         </label>
+                        <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Auto-reply all</span>
                     </div>
-                    <div class="form-group toggle-group" style="flex: 1;">
-                        <label>Smart Away Mode</label>
+                    <div class="form-group toggle-group" style="flex: 1; min-width: 95px;">
+                        <label>Smart Away</label>
                         <label class="switch">
                             <input type="checkbox" name="away_mode" value="on">
                             <span class="slider"></span>
                         </label>
+                        <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Auto-sleeps</span>
+                    </div>
+                    <div class="form-group toggle-group" style="flex: 1; min-width: 95px;">
+                        <label>AI Fallback</label>
+                        <label class="switch">
+                            <input type="checkbox" name="ai_fallback" value="on" checked>
+                            <span class="slider"></span>
+                        </label>
+                        <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">OpenRouter</span>
+                    </div>
+                    <div class="form-group" style="flex: 2; min-width: 170px;">
+                        <label>AI Model String for All Accounts</label>
+                        <input type="text" name="model" class="form-control" value="{html.escape(bulk_model)}" placeholder="e.g. google/gemini-2.5-flash">
                     </div>
                 </div>
-                <button type="submit" class="btn btn-primary btn-full">⚡ Overwrite & Synchronize All Accounts</button>
+                <button type="submit" class="btn btn-primary btn-full" style="padding: 12px; font-size: 14px; font-weight: 600;">⚡ Overwrite & Synchronize All Accounts</button>
             </form>
         </div>
 
@@ -2075,6 +2367,7 @@ async def health_check():
             "connected_accounts": len(accounts),
             "active_auto_responders": active_count,
             "away_mode_active": sum(1 for a in accounts.values() if a.away_mode),
+            "trigger_all_active": sum(1 for a in accounts.values() if a.trigger_all),
             "total_triggers_configured": total_triggers,
             "openrouter_status": "READY" if OPENROUTER_API_KEY else "NOT_CONFIGURED",
         },
@@ -2091,12 +2384,17 @@ app.include_router(health_router)
 @app.post("/bulk-update")
 async def bulk_update_accounts(request: Request):
     """
-    Overwrites trigger rules, AI fallback state, and model string for all connected accounts.
+    Overwrites trigger rules, custom message, trigger_all state, AI fallback state, and model string for all connected accounts.
     """
     body = (await request.body()).decode("utf-8")
     data = urllib.parse.parse_qs(body)
 
     triggers_raw = data.get("triggers", [""])[0].strip()
+    custom_message = (
+        data.get("custom_message", [DEFAULT_CUSTOM_MESSAGE])[0].strip()
+        or DEFAULT_CUSTOM_MESSAGE
+    )
+    trigger_all = "trigger_all" in data
     ai_fallback = "ai_fallback" in data
     away_mode = "away_mode" in data
     model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
@@ -2105,6 +2403,8 @@ async def bulk_update_accounts(request: Request):
     for acc in accounts.values():
         acc.triggers_raw = triggers_raw
         acc.triggers = parsed_rules
+        acc.custom_message = custom_message
+        acc.trigger_all = trigger_all
         acc.ai_fallback = ai_fallback
         acc.away_mode = away_mode
         acc.model = model
@@ -2112,7 +2412,7 @@ async def bulk_update_accounts(request: Request):
         await db_manager.save_account(acc)
 
     logger.info(
-        f"Bulk update executed: applied {len(parsed_rules)} triggers, AI fallback={ai_fallback}, model='{model}' across {len(accounts)} accounts."
+        f"Bulk update executed: applied {len(parsed_rules)} triggers, trigger_all={trigger_all}, AI fallback={ai_fallback}, model='{model}' across {len(accounts)} accounts."
     )
     return RedirectResponse(
         url="/?msg=All+connected+accounts+synchronized+successfully", status_code=303
@@ -2122,7 +2422,7 @@ async def bulk_update_accounts(request: Request):
 @app.post("/account/{user_id}/update")
 async def update_account_config(user_id: int, request: Request):
     """
-    Updates configuration for an individual connected business account.
+    Updates configuration and messages for an individual connected business account.
     """
     if user_id not in accounts:
         return RedirectResponse(
@@ -2135,6 +2435,11 @@ async def update_account_config(user_id: int, request: Request):
 
     acc.triggers_raw = data.get("triggers", [""])[0].strip()
     acc.triggers = parse_triggers(acc.triggers_raw)
+    acc.custom_message = (
+        data.get("custom_message", [DEFAULT_CUSTOM_MESSAGE])[0].strip()
+        or DEFAULT_CUSTOM_MESSAGE
+    )
+    acc.trigger_all = "trigger_all" in data
     acc.ai_fallback = "ai_fallback" in data
     acc.away_mode = "away_mode" in data
     acc.model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
@@ -2143,10 +2448,11 @@ async def update_account_config(user_id: int, request: Request):
     await db_manager.save_account(acc)
 
     logger.info(
-        f"[Account @{acc.username or user_id}] Updated: {len(acc.triggers)} triggers, AI fallback={acc.ai_fallback}, model='{acc.model}'"
+        f"[Account @{acc.username or user_id}] Updated: trigger_all={acc.trigger_all}, {len(acc.triggers)} triggers, AI fallback={acc.ai_fallback}, model='{acc.model}'"
     )
     return RedirectResponse(
-        url=f"/?msg=Account+settings+saved+successfully", status_code=303
+        url=f"/?msg=Settings+and+messages+saved+successfully+for+@{html.escape(acc.username or str(user_id))}",
+        status_code=303,
     )
 
 
