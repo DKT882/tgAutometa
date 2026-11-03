@@ -30,6 +30,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("tg_business_bot")
+# Suppress noisy background reconnection tracebacks from pymongo driver
+logging.getLogger("pymongo").setLevel(logging.CRITICAL)
 
 # ---------------------------------------------------------------------------
 # Global Environment & Configuration
@@ -94,14 +96,26 @@ class DatabaseManager:
             )
             return
 
+        # Check for unreplaced placeholder template strings in MONGO_URI
+        if any(
+            p in MONGO_URI
+            for p in ["<password>", "<db_password>", "username:password", "<username>"]
+        ):
+            logger.error(
+                "[DB] MONGO_URI contains unreplaced placeholder text (like '<password>' or 'username:password'). "
+                "Please replace it with your actual MongoDB Atlas database username and password in Render Environment Variables. "
+                "Operating in in-memory mode safely."
+            )
+            return
+
         try:
             logger.info("Connecting to MongoDB cluster...")
             self.client = motor.motor_asyncio.AsyncIOMotorClient(
                 MONGO_URI,
-                serverSelectionTimeoutMS=5000,
-                connectTimeoutMS=5000,
-                maxPoolSize=25,
-                minPoolSize=2,
+                serverSelectionTimeoutMS=4000,
+                connectTimeoutMS=4000,
+                maxPoolSize=20,
+                minPoolSize=1,
             )
             # Ping database to verify connection
             await self.client.admin.command("ping")
@@ -129,10 +143,22 @@ class DatabaseManager:
                     pass
                 self.client = None
             self.db = None
-            logger.error(
-                f"[DB] Failed to connect to MongoDB: {exc}. Falling back to in-memory mode.",
-                exc_info=False,
-            )
+            err_msg = str(exc)
+            if (
+                "Authentication failed" in err_msg
+                or "bad auth" in err_msg
+                or "code 8000" in err_msg
+            ):
+                logger.error(
+                    "[DB] MongoDB Authentication Failed (bad auth): The username or password in MONGO_URI is incorrect. "
+                    "Please verify your Database User credentials in MongoDB Atlas (Security -> Database Access). "
+                    "Falling back to in-memory mode safely."
+                )
+            else:
+                logger.error(
+                    f"[DB] Failed to connect to MongoDB ({err_msg}). Falling back to in-memory mode.",
+                    exc_info=False,
+                )
 
     async def close(self):
         if self.client:
