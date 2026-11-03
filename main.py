@@ -155,6 +155,9 @@ class DatabaseManager:
                 "can_reply": account.can_reply,
                 "is_enabled": account.is_enabled,
                 "active": account.active,
+                "away_mode": account.away_mode,
+                "away_timeout_minutes": account.away_timeout_minutes,
+                "last_owner_activity": account.last_owner_activity,
                 "triggers_raw": account.triggers_raw,
                 "triggers": account.triggers,
                 "ai_fallback": account.ai_fallback,
@@ -330,6 +333,9 @@ class ConnectedAccount:
     model: str = DEFAULT_MODEL
     active: bool = True
     processed_count: int = 0
+    away_mode: bool = False
+    away_timeout_minutes: int = 5
+    last_owner_activity: Optional[datetime] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -471,11 +477,27 @@ async def process_business_message(message: dict):
     if not account or not account.active or not account.can_reply:
         return
 
-    # Ignore messages sent by the business account owner themselves
+    # Handle messages sent by the business account owner themselves
     sender = message.get("from", {})
     sender_id = sender.get("id")
     if sender_id == account.user_id:
+        account.last_owner_activity = datetime.now(timezone.utc)
+        logger.info(
+            f"[Account @{account.username or account.user_id}] Owner is active. Updated last activity timestamp."
+        )
         return
+
+    # Smart Away Mode: Suppress bot response when the account owner is active
+    if account.away_mode and account.last_owner_activity:
+        idle_seconds = (datetime.now(timezone.utc) - account.last_owner_activity).total_seconds()
+        timeout_seconds = account.away_timeout_minutes * 60
+        if idle_seconds < timeout_seconds:
+            remaining_mins = max(1, int((timeout_seconds - idle_seconds) / 60))
+            logger.info(
+                f"[Account @{account.username or account.user_id}] Smart Away Mode: "
+                f"Owner is ONLINE (active {int(idle_seconds)}s ago). Auto-responder deactivated for {remaining_mins}m."
+            )
+            return
 
     # Ignore messages from automated bots
     if sender.get("is_bot", False):
@@ -698,12 +720,31 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
     """
     status_text = "Active ✅ (Replying)" if (acc.active and acc.can_reply) else "Paused ⏸️"
     ai_status = "✅ ENABLED" if acc.ai_fallback else "❌ DISABLED"
+    away_status = (
+        "✅ ENABLED (Deactivates when you are online)"
+        if acc.away_mode
+        else "❌ DISABLED (Always active)"
+    )
+
+    if not acc.last_owner_activity:
+        presence_str = "💤 OFFLINE (No recent outgoing DMs)"
+    else:
+        idle_s = int(
+            (datetime.now(timezone.utc) - acc.last_owner_activity).total_seconds()
+        )
+        if idle_s < (acc.away_timeout_minutes * 60):
+            presence_str = f"🟢 ONLINE (Active {int(idle_s / 60)}m ago)"
+        else:
+            presence_str = f"💤 OFFLINE (Idle for {int(idle_s / 60)}m)"
+
     triggers_count = len(acc.triggers)
 
     text = (
         f"<b>SETTINGS</b>\n"
         f"<b>Account:</b> @{html.escape(acc.username or str(acc.user_id))} ({html.escape(acc.first_name)})\n\n"
         f"• <b>Status:</b> {status_text}\n"
+        f"• <b>Owner Presence:</b> {presence_str}\n"
+        f"• <b>Smart Away Mode:</b> {away_status}\n"
         f"• <b>AI Fallback:</b> {ai_status}\n"
         f"• <b>AI Model:</b> <code>{html.escape(acc.model)}</code>\n"
         f"• <b>Predefined Triggers:</b> {triggers_count} active rule(s)\n"
@@ -713,11 +754,19 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
 
     ai_btn_text = "🤖 AI Fallback: ON" if acc.ai_fallback else "🤖 AI Fallback: OFF"
     active_btn_text = "⚡ Status: ACTIVE" if acc.active else "⚡ Status: PAUSED"
+    away_btn_text = "🌙 Away Mode: ON" if acc.away_mode else "🌙 Away Mode: OFF"
 
     keyboard = [
         [
             {"text": ai_btn_text, "callback_data": f"tog_ai_{acc.user_id}"},
             {"text": active_btn_text, "callback_data": f"tog_act_{acc.user_id}"},
+        ],
+        [
+            {"text": away_btn_text, "callback_data": f"tog_away_{acc.user_id}"},
+            {
+                "text": f"⏱️ Timeout: {acc.away_timeout_minutes}m",
+                "callback_data": f"away_time_{acc.user_id}",
+            },
         ],
         [
             {"text": "📝 View Triggers", "callback_data": f"view_trig_{acc.user_id}"},
@@ -868,6 +917,38 @@ async def handle_callback_query(cq: dict):
             await db_manager.save_account(acc)
             status_msg = "Auto-Responder Resumed" if acc.active else "Auto-Responder Paused"
             await answer(status_msg)
+            text, kb = build_account_settings_menu(acc)
+            await edit(text, kb)
+        return
+
+    # Toggle Smart Away Mode
+    if data.startswith("tog_away_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if acc:
+            acc.away_mode = not acc.away_mode
+            await db_manager.save_account(acc)
+            status_msg = (
+                "Smart Away Mode Enabled: Bot auto-deactivates when you are online, auto-activates when you are offline."
+                if acc.away_mode
+                else "Smart Away Mode Disabled: Bot is always auto-replying."
+            )
+            await answer(status_msg, alert=True)
+            text, kb = build_account_settings_menu(acc)
+            await edit(text, kb)
+        return
+
+    # Cycle Away Timeout
+    if data.startswith("away_time_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if acc:
+            delays = [2, 5, 10, 15]
+            curr_idx = delays.index(acc.away_timeout_minutes) if acc.away_timeout_minutes in delays else 1
+            next_delay = delays[(curr_idx + 1) % len(delays)]
+            acc.away_timeout_minutes = next_delay
+            await db_manager.save_account(acc)
+            await answer(f"Away threshold set to {next_delay} minutes of inactivity.")
             text, kb = build_account_settings_menu(acc)
             await edit(text, kb)
         return
@@ -1189,6 +1270,9 @@ async def lifespan(app: FastAPI):
             model=doc.get("model", DEFAULT_MODEL),
             active=doc.get("active", True),
             processed_count=doc.get("processed_count", 0),
+            away_mode=doc.get("away_mode", False),
+            away_timeout_minutes=doc.get("away_timeout_minutes", 5),
+            last_owner_activity=doc.get("last_owner_activity"),
         )
         accounts[uid] = acc
         if acc.connection_id:
@@ -1307,11 +1391,23 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 )
 
             ai_checked = "checked" if acc.ai_fallback else ""
+            away_checked = "checked" if acc.away_mode else ""
             user_title = (
                 f"@{html.escape(acc.username)}"
                 if acc.username
                 else f"Account #{acc.user_id}"
             )
+
+            if not acc.last_owner_activity:
+                presence_pill = "Presence: <strong style='color:#94a3b8;'>Offline</strong>"
+            else:
+                idle_s = int(
+                    (datetime.now(timezone.utc) - acc.last_owner_activity).total_seconds()
+                )
+                if idle_s < (acc.away_timeout_minutes * 60):
+                    presence_pill = f"Presence: <strong style='color:#4ade80;'>Online ({int(idle_s / 60)}m ago)</strong>"
+                else:
+                    presence_pill = f"Presence: <strong style='color:#94a3b8;'>Away ({int(idle_s / 60)}m ago)</strong>"
 
             cards_html += f"""
             <div class="card account-card">
@@ -1328,6 +1424,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
 
                 <div class="stat-pill-row">
                     <span class="stat-pill">DMs Auto-Responded: <strong>{acc.processed_count}</strong></span>
+                    <span class="stat-pill">{presence_pill}</span>
                     <span class="stat-pill">Status: <strong>{'Enabled' if acc.is_enabled else 'Disconnected'}</strong></span>
                 </div>
 
@@ -1348,6 +1445,14 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                                 <input type="checkbox" name="ai_fallback" value="on" {ai_checked}>
                                 <span class="slider"></span>
                             </label>
+                        </div>
+                        <div class="form-group toggle-group" style="flex: 1;">
+                            <label>Away Mode</label>
+                            <label class="switch">
+                                <input type="checkbox" name="away_mode" value="on" {away_checked}>
+                                <span class="slider"></span>
+                            </label>
+                            <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px;">Auto-sleeps</span>
                         </div>
                     </div>
 
@@ -1845,6 +1950,13 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                             <span class="slider"></span>
                         </label>
                     </div>
+                    <div class="form-group toggle-group" style="flex: 1;">
+                        <label>Smart Away Mode</label>
+                        <label class="switch">
+                            <input type="checkbox" name="away_mode" value="on">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
                 </div>
                 <button type="submit" class="btn btn-primary btn-full">⚡ Overwrite & Synchronize All Accounts</button>
             </form>
@@ -1929,6 +2041,7 @@ async def health_check():
         "stats": {
             "connected_accounts": len(accounts),
             "active_auto_responders": active_count,
+            "away_mode_active": sum(1 for a in accounts.values() if a.away_mode),
             "total_triggers_configured": total_triggers,
             "openrouter_status": "READY" if OPENROUTER_API_KEY else "NOT_CONFIGURED",
         },
@@ -1952,6 +2065,7 @@ async def bulk_update_accounts(request: Request):
 
     triggers_raw = data.get("triggers", [""])[0].strip()
     ai_fallback = "ai_fallback" in data
+    away_mode = "away_mode" in data
     model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
     parsed_rules = parse_triggers(triggers_raw)
 
@@ -1959,6 +2073,7 @@ async def bulk_update_accounts(request: Request):
         acc.triggers_raw = triggers_raw
         acc.triggers = parsed_rules
         acc.ai_fallback = ai_fallback
+        acc.away_mode = away_mode
         acc.model = model
         # Persist to MongoDB
         await db_manager.save_account(acc)
@@ -1988,6 +2103,7 @@ async def update_account_config(user_id: int, request: Request):
     acc.triggers_raw = data.get("triggers", [""])[0].strip()
     acc.triggers = parse_triggers(acc.triggers_raw)
     acc.ai_fallback = "ai_fallback" in data
+    acc.away_mode = "away_mode" in data
     acc.model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
 
     # Persist to MongoDB

@@ -13,7 +13,11 @@ Runs seamlessly on the **Render Free Tier** (0.1 vCPU, 500MB RAM) with an ultra-
 1. **Multi-Account Concurrency via Telegram Business**:
    - Single `@BotFather` bot handles unlimited connected personal Telegram accounts.
    - Each account has completely isolated settings, trigger rules, AI fallback choices, and message counters.
-2. **Database Persistence (MongoDB)**:
+2. **Smart Away Mode (Auto-Offline Detection)**:
+   - When the user is **actively chatting** on their Telegram account, the bot automatically **deactivates** so it never speaks over the human.
+   - When the user goes **offline / idle** (e.g. no messages sent for > 5 minutes), the bot automatically **activates** and manages all incoming DMs!
+   - Fully toggleable ON/OFF per account with adjustable inactivity timeouts (2m, 5m, 10m, 15m) directly in the Telegram DM wizard and web dashboard.
+3. **Database Persistence (MongoDB)**:
    - Built using non-blocking async **Motor** (`motor.motor_asyncio`).
    - Persists all account configurations, custom triggers, AI model selections, and audit message logs.
    - Restores all accounts into a fast in-memory cache on startup for sub-millisecond response latency.
