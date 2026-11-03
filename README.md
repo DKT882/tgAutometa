@@ -12,29 +12,33 @@ Runs seamlessly on the **Render Free Tier** (0.1 vCPU, 500MB RAM) with an ultra-
 
 1. **Multi-Account Concurrency via Telegram Business**:
    - Single `@BotFather` bot handles unlimited connected personal Telegram accounts.
-   - Each account has completely isolated settings, trigger rules, custom auto-reply messages, AI fallback choices, and message counters.
-2. **Keyword Conditions vs Reply to All Dual Mode**:
-   - **Keyword Trigger ON**: Checks conditions (different keywords ➔ different replies). When an incoming DM contains a configured keyword (e.g. `pricing`, `help`, `link`), it sends that keyword's specific reply (with rich preview cards for links). Non-matching DMs are ignored cleanly.
-   - **Keyword Trigger OFF**: Replies to **ALL incoming DMs** with the **Customized Auto-Reply Message** (with rich link previews for `https://t.me/...`), no matter what keyword or text the sender typed!
+   - Each account has completely isolated settings, trigger rules, multi-response bubbles, AI fallback choices, and message counters.
+2. **Sequential Multi-Response Bubbles (Dynamic Add & Remove)**:
+   - The bot can send **1, 2, 3, 4, or more sequential response bubbles** for a single customer message event.
+   - First bubble responds immediately; subsequent bubbles follow with natural **~0.9s typing delays** and native Telegram `typing` chat actions.
+   - Add or remove bubbles dynamically on the Web Dashboard (`[➕ Add Response Bubble]` / `[🗑️ Remove]`) or inside Telegram DM (`[➕ Add Next Bubble]` / `[🗑️ Remove Last Bubble]`).
+3. **Direct Quote Reply (Quoting Customer Message)**:
+   - Uses Telegram Bot API's native `reply_parameters={"message_id": incoming_msg_id, "allow_sending_without_reply": true}`.
+   - The bot directly **quotes and replies** to the customer's incoming message bubble in the business chat.
+   - Toggleable **ON / OFF** per account with a single click.
+4. **Keyword Conditions vs Reply to All Dual Mode**:
+   - **Keyword Trigger ON**: Checks conditions (different keywords ➔ different replies). When an incoming DM contains a configured keyword (e.g. `pricing`, `help`, `link`), it sends that keyword's specific reply sequence (with rich preview cards for links). Non-matching DMs are ignored cleanly.
+   - **Keyword Trigger OFF**: Replies to **ALL incoming DMs** with the **Customized Response Bubbles** (with rich link previews for `https://t.me/...`), no matter what keyword or text the sender typed!
    - Toggleable directly in the Telegram DM wizard (`[🔑 Keywords: ON/OFF]`) or the Web Dashboard.
-3. **Smart Away Mode (Auto-Offline Detection)**:
+5. **Smart Away Mode (Auto-Offline Detection)**:
    - When the user is **actively chatting** on their Telegram account, the bot automatically **deactivates** so it never speaks over the human.
    - When the user goes **offline / idle** (e.g. no messages sent for > 5 minutes), the bot automatically **activates** and manages all incoming DMs!
-   - Fully toggleable ON/OFF per account with adjustable inactivity timeouts (2m, 5m, 10m, 15m) directly in the Telegram DM wizard and web dashboard.
-4. **Database Persistence (MongoDB)**:
+   - Fully toggleable ON/OFF per account with adjustable inactivity timeouts (2m, 5m, 10m, 15m).
+6. **Live Analytics & Customer Interaction Audit Log**:
+   - Detailed telemetry tracking: Total DMs responded, Keyword Matches, Reply-All Custom Replies, and AI Fallbacks.
+   - Rolling in-memory and MongoDB audit log of recent customer interactions (customer handle, incoming text, bot reply bubbles, response type, timestamp).
+   - Works seamlessly with or without an active MongoDB connection.
+7. **Database Persistence (MongoDB with In-Memory Fallback)**:
    - Built using non-blocking async **Motor** (`motor.motor_asyncio`).
-   - Persists all account configurations, custom messages, custom triggers, AI model selections, and audit message logs.
+   - Persists all account configurations, response bubbles, custom triggers, AI model selections, and audit message logs.
    - Restores all accounts into a fast in-memory cache on startup for sub-millisecond response latency.
-5. **Interactive Telegram DM Setup Wizard**:
-   - Send `/settings` or `/start` to the bot in private DM.
-   - **Account Picker**: Interactive menu listing all connected accounts with active status indicators.
-   - **Account Settings Panel**: Toggle Trigger All, edit custom messages with live test preview, toggle AI fallback, toggle away mode, view/add triggers, pick AI models, and inspect analytics.
-6. **Multi-Stage Responding Pipeline**:
-   - **Step A (Triggers)**: Predefined keyword containment matching (`.lower()`).
-   - **Step B (Trigger All)**: When enabled, sends your customized auto-reply message with rich Telegram link preview cards.
-   - **Step C (OpenRouter AI Fallback)**: Sends Telegram's native `typing...` action indicator and generates a 2-sentence conversational response via OpenRouter API.
-7. **Real-Time Web Dashboard**:
-   - Served directly on root `GET /` with live status indicators, enlarged message textareas, prominent `💾 Save Settings & Messages` button, and bulk synchronization tools.
+8. **Real-Time Web Dashboard**:
+   - Served directly on root `GET /` with live status indicators, dynamic bubble manager, enlarged textareas, prominent `💾 Save Settings & Messages` button, and bulk synchronization tools.
 
 ---
 
@@ -42,8 +46,8 @@ Runs seamlessly on the **Render Free Tier** (0.1 vCPU, 500MB RAM) with an ultra-
 
 | Collection | Key Fields | Purpose |
 |---|---|---|
-| `accounts` | `_id (user_id)`, `connection_id`, `username`, `triggers`, `ai_fallback`, `model`, `active`, `processed_count` | Stores account settings, triggers, and state. |
-| `message_logs` | `account_id`, `customer_id`, `incoming_text`, `response_type`, `matched_keyword`, `ai_model`, `response_text`, `timestamp` | Detailed interaction audit logs and analytics. |
+| `accounts` | `_id (user_id)`, `connection_id`, `username`, `custom_messages`, `quote_reply`, `triggers`, `ai_fallback`, `model`, `active`, `processed_count` | Stores account settings, multi-bubbles, and state. |
+| `message_logs` | `account_id`, `customer_id`, `customer_name`, `incoming_text`, `response_type`, `matched_keyword`, `ai_model`, `response_text`, `timestamp` | Detailed interaction audit logs and analytics. |
 | `bot_settings` | `_id ("global")`, `default_triggers_raw`, `default_model` | Global fallback presets. |
 
 ---
@@ -70,18 +74,33 @@ Send `/settings` to the bot in a private chat to access the wizard:
 │ • Status: Active ✅ (Replying to DMs)         │
 │ • Owner Presence: 💤 OFFLINE                  │
 │ • Smart Away Mode: ❌ DISABLED                │
-│ • Trigger on All Msgs: ✅ ENABLED             │
-│ • Custom Message: "Join our group: https://…" │
+│ • Direct Quote Reply: ✅ ENABLED              │
+│ • Active Mode: 🔑 KEYWORDS (Rules)            │
+│ • Response Bubbles: 2 bubble(s)               │
 │ • AI Fallback: ❌ DISABLED                    │
-│ • Predefined Triggers: 3 active rule(s)       │
 │ • DMs Auto-Responded: 14                      │
 │                                               │
 │ [ 🤖 AI Fallback: OFF ] [ ⚡ Status: ACTIVE  ] │
 │ [ 🌙 Away Mode: OFF   ] [ ⏱️ Timeout: 5m      ] │
-│ [ 🎯 Trigger All: ON  ] [ 💬 Custom Message  ] │
+│ [ 🔑 Keywords: ON     ] [ ↩️ Quote: ON       ] │
+│ [ 💬 Response Bubbles ] [ 📊 Analytics       ] │
 │ [ 📝 View Triggers    ] [ ➕ Add Trigger     ] │
-│ [ 🧠 Change Model     ] [ 📊 Analytics       ] │
-│ [ ⬅️ Back to Accounts ] [ 🔄 Reload          ] │
+│ [ 🧠 Change Model     ] [ 🔄 Reload          ] │
+│ [ ⬅️ Back to Accounts ] [ ✅ Close           ] │
+└───────────────────────────────────────────────┘
+                        │
+                        ▼ (Tap Response Bubbles)
+┌───────────────────────────────────────────────┐
+│ 💬 MULTI-RESPONSE BUBBLE MANAGER              │
+│ Bubble #1 (Quotes Customer):                  │
+│ <blockquote>Hello! Thanks for connecting.</blockquote>  │
+│ Bubble #2:                                    │
+│ <blockquote>Join our group: https://t.me/+xyz</blockquote>│
+│                                               │
+│ [ ➕ Add Next Bubble  ] [ 🗑️ Remove Last    ] │
+│ [ ✏️ Edit Bubble #1   ] [ 👁️ Test Preview   ] │
+│ [ ↩️ Quote Reply: ON  ] [ 🔄 Reset Default   ] │
+│ [ ⬅️ Back to Settings                        ] │
 └───────────────────────────────────────────────┘
 ```
 
@@ -143,19 +162,28 @@ Access `GET /health` or `GET /api/health` to monitor the operational status, dat
       "accounts_saved": 4,
       "messages_logged": 6644,
       "triggers_matched": 5536,
-      "ai_fallbacks_generated": 1108,
-      "last_heartbeat": "2026-11-03 18:20:08.904000"
+      "reply_all_sent": 890,
+      "ai_fallbacks_generated": 218,
+      "last_heartbeat": "2026-11-04 03:10:00.000000"
     }
   },
   "stats": {
     "connected_accounts": 4,
     "active_auto_responders": 4,
+    "total_dms_processed": 6644,
+    "keyword_matches_count": 5536,
+    "reply_all_count": 890,
+    "ai_fallbacks_count": 218,
+    "away_mode_active": 2,
+    "quote_reply_active": 4,
+    "keyword_triggers_active": 3,
+    "reply_all_active": 1,
     "total_triggers_configured": 12,
     "openrouter_status": "READY"
   },
   "uptime": "22h 23m 46s",
   "uptime_seconds": 80626,
-  "timestamp": "2026-11-03 18:20:20 UTC"
+  "timestamp": "2026-11-04 03:10:00 UTC"
 }
 ```
 
@@ -163,7 +191,7 @@ Access `GET /health` or `GET /api/health` to monitor the operational status, dat
 
 ## ☁️ Deploying to Render Free Tier
 
-1. Create a **New Web Service** on [Render](https://render.com) and link the repo.
+1. Create a **New Web Service** on [Render](https://render.com) and link the repository.
 2. Configure:
    - **Environment**: Python 3
    - **Build Command**: `pip install -r requirements.txt`
