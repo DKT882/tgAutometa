@@ -122,6 +122,13 @@ class DatabaseManager:
             )
         except Exception as exc:
             self.connected = False
+            if self.client:
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
+                self.client = None
+            self.db = None
             logger.error(
                 f"[DB] Failed to connect to MongoDB: {exc}. Falling back to in-memory mode.",
                 exc_info=False,
@@ -233,7 +240,7 @@ class DatabaseManager:
 
     async def get_health_metrics(self) -> dict:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
-        if not self.connected or self.db is None:
+        if not self.connected or self.client is None or self.db is None:
             triggers_sum = sum(a.processed_count for a in accounts.values())
             return {
                 "connected": False,
@@ -1980,7 +1987,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
 # ---------------------------------------------------------------------------
 # HTTP Endpoints & Form Action Handlers
 # ---------------------------------------------------------------------------
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def dashboard_view(msg: str = "", err: str = ""):
     """
     Renders the lightweight HTML UI dashboard.
@@ -1991,8 +1998,8 @@ async def dashboard_view(msg: str = "", err: str = ""):
 health_router = APIRouter(tags=["Health"])
 
 
-@health_router.get("/health")
-@health_router.get("/api/health")
+@health_router.api_route("/health", methods=["GET", "HEAD"])
+@health_router.api_route("/api/health", methods=["GET", "HEAD"])
 async def health_check():
     """
     Detailed operational health and telemetry endpoint for Render and external monitors.
