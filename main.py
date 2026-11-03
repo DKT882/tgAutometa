@@ -18,8 +18,8 @@ from typing import Any, Dict, List, Optional
 import httpx
 import motor.motor_asyncio
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 # ---------------------------------------------------------------------------
 # Logging Configuration
@@ -45,9 +45,17 @@ MONGO_URI = (
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "tg_business_autoresponder").strip()
 PORT = int(os.getenv("PORT", 8000))
 
+# Service start time for uptime tracking
+service_start_time = datetime.now(timezone.utc)
+SERVICE_NAME = os.getenv("SERVICE_NAME", "TelegramBusinessAutoResponder").strip()
+
 # Shared HTTPX AsyncClient and Bot identity
 http_client: Optional[httpx.AsyncClient] = None
-bot_info: Dict[str, str] = {"username": "BotFatherBot", "first_name": "Business Bot"}
+bot_info: Dict[str, Any] = {
+    "username": "BotFatherBot",
+    "first_name": "Business Bot",
+    "id": None,
+}
 polling_task: Optional[asyncio.Task] = None
 
 # Default trigger rules for all accounts
@@ -219,6 +227,47 @@ class DatabaseManager:
             return {"total": total, "triggers": triggers, "ai": ai}
         except Exception:
             return {"total": 0, "triggers": 0, "ai": 0}
+
+    async def get_health_metrics(self) -> dict:
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+        if not self.connected or self.db is None:
+            triggers_sum = sum(a.processed_count for a in accounts.values())
+            return {
+                "connected": False,
+                "accounts_saved": len(accounts),
+                "messages_logged": 0,
+                "triggers_matched": triggers_sum,
+                "ai_fallbacks_generated": 0,
+                "last_heartbeat": now_str,
+            }
+        try:
+            await self.client.admin.command("ping")
+            accounts_count = await self.accounts_col.count_documents({})
+            messages_count = await self.logs_col.count_documents({})
+            triggers_count = await self.logs_col.count_documents(
+                {"response_type": "trigger"}
+            )
+            ai_count = await self.logs_col.count_documents(
+                {"response_type": "ai_fallback"}
+            )
+            return {
+                "connected": True,
+                "accounts_saved": accounts_count,
+                "messages_logged": messages_count,
+                "triggers_matched": triggers_count,
+                "ai_fallbacks_generated": ai_count,
+                "last_heartbeat": now_str,
+            }
+        except Exception as exc:
+            logger.error(f"[DB] Health heartbeat ping failed: {exc}")
+            return {
+                "connected": False,
+                "accounts_saved": len(accounts),
+                "messages_logged": 0,
+                "triggers_matched": 0,
+                "ai_fallbacks_generated": 0,
+                "last_heartbeat": now_str,
+            }
 
 
 db_manager = DatabaseManager()
@@ -1164,8 +1213,9 @@ async def lifespan(app: FastAPI):
         if me:
             bot_info["username"] = me.get("username", "UnknownBot")
             bot_info["first_name"] = me.get("first_name", "Business Bot")
+            bot_info["id"] = me.get("id")
             logger.info(
-                f"Bot verified: @{bot_info['username']} ({bot_info['first_name']})"
+                f"Bot verified: @{bot_info['username']} (ID: {bot_info['id']}, Name: {bot_info['first_name']})"
             )
         else:
             logger.error("Failed to verify BOT_TOKEN with Telegram API!")
@@ -1826,20 +1876,70 @@ async def dashboard_view(msg: str = "", err: str = ""):
     return HTMLResponse(content=render_dashboard(msg=msg, err=err), status_code=200)
 
 
-@app.get("/health")
+health_router = APIRouter(tags=["Health"])
+
+
+@health_router.get("/health")
+@health_router.get("/api/health")
 async def health_check():
     """
-    Operational monitoring endpoint for Render health checks and uptime monitoring.
+    Detailed operational health and telemetry endpoint for Render and external monitors.
+    Returns JSON payload matching the service status, database metrics, and bot states.
     """
+    now = datetime.now(timezone.utc)
+    delta = now - service_start_time
+    uptime_seconds = int(delta.total_seconds())
+
+    days, rem = divmod(uptime_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    if days > 0:
+        uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
+    elif hours > 0:
+        uptime_str = f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        uptime_str = f"{minutes}m {seconds}s"
+    else:
+        uptime_str = f"{seconds}s"
+
+    db_metrics = await db_manager.get_health_metrics()
+
+    db_type = "In-Memory (Volatile)"
+    if db_manager.connected:
+        db_type = "MongoDB Atlas" if "mongodb+srv" in MONGO_URI else "MongoDB Local"
+
+    is_bot_online = bool(polling_task and not polling_task.done() and bot_info.get("id"))
     active_count = sum(1 for a in accounts.values() if a.active and a.can_reply)
-    return {
-        "status": "healthy",
-        "bot_username": bot_info.get("username"),
-        "connected_accounts": len(accounts),
-        "active_accounts": active_count,
-        "database_connected": db_manager.connected,
-        "openrouter_configured": bool(OPENROUTER_API_KEY),
+    total_triggers = sum(len(a.triggers) for a in accounts.values())
+
+    health_payload = {
+        "status": "UP" if is_bot_online or not BOT_TOKEN else "DEGRADED",
+        "service": SERVICE_NAME,
+        "telegram_bot": {
+            "status": "ONLINE" if is_bot_online else "OFFLINE",
+            "username": bot_info.get("username", "UnknownBot"),
+            "id": bot_info.get("id"),
+        },
+        "database": {
+            "type": db_type,
+            "connected": db_manager.connected,
+            "metrics": db_metrics,
+        },
+        "stats": {
+            "connected_accounts": len(accounts),
+            "active_auto_responders": active_count,
+            "total_triggers_configured": total_triggers,
+            "openrouter_status": "READY" if OPENROUTER_API_KEY else "NOT_CONFIGURED",
+        },
+        "uptime": uptime_str,
+        "uptime_seconds": uptime_seconds,
+        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
+    return JSONResponse(content=health_payload, status_code=200)
+
+
+app.include_router(health_router)
 
 
 @app.post("/bulk-update")

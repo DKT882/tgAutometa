@@ -108,6 +108,45 @@ python main.py
 
 ---
 
+## 🩺 Health & Telemetry Router (`/health`)
+
+Access `GET /health` or `GET /api/health` to monitor the operational status, database heartbeat, and bot state:
+
+```json
+{
+  "status": "UP",
+  "service": "TelegramBusinessAutoResponder",
+  "telegram_bot": {
+    "status": "ONLINE",
+    "username": "bioLinkChannelBot",
+    "id": 9208828911
+  },
+  "database": {
+    "type": "MongoDB Atlas",
+    "connected": true,
+    "metrics": {
+      "connected": true,
+      "accounts_saved": 4,
+      "messages_logged": 6644,
+      "triggers_matched": 5536,
+      "ai_fallbacks_generated": 1108,
+      "last_heartbeat": "2026-11-03 18:20:08.904000"
+    }
+  },
+  "stats": {
+    "connected_accounts": 4,
+    "active_auto_responders": 4,
+    "total_triggers_configured": 12,
+    "openrouter_status": "READY"
+  },
+  "uptime": "22h 23m 46s",
+  "uptime_seconds": 80626,
+  "timestamp": "2026-11-03 18:20:20 UTC"
+}
+```
+
+---
+
 ## ☁️ Deploying to Render Free Tier
 
 1. Create a **New Web Service** on [Render](https://render.com) and link the repo.
