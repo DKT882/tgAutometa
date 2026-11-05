@@ -93,7 +93,7 @@ def split_message_bubbles(content: str) -> List[str]:
     Splits message content into discrete response bubbles.
     Supports '---' or '===' delimiter or newline separation.
     """
-    if not content:
+    if not content or not content.strip():
         return []
     parts = BUBBLE_SPLIT_REGEX.split(content)
     bubbles = [p.strip() for p in parts if p.strip()]
@@ -159,7 +159,6 @@ class ConnectedAccount:
     away_mode: bool = False
     away_timeout_minutes: int = 5
     last_owner_activity: Optional[datetime] = None
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def get_bubbles(self) -> List[str]:
         if self.custom_messages:
@@ -190,7 +189,6 @@ class DatabaseManager:
         self.db = None
         self.accounts_col = None
         self.logs_col = None
-        self.settings_col = None
         self.connected = False
 
     async def connect(self):
@@ -224,7 +222,6 @@ class DatabaseManager:
             self.db = self.client[MONGO_DB_NAME]
             self.accounts_col = self.db["accounts"]
             self.logs_col = self.db["message_logs"]
-            self.settings_col = self.db["bot_settings"]
 
             await self.accounts_col.create_index("connection_id", sparse=True)
             await self.accounts_col.create_index("username")
@@ -1163,6 +1160,10 @@ async def handle_callback_query(cq: dict):
     message_id = cq.get("message", {}).get("message_id")
     data = cq.get("data", "")
 
+    # Clean up lingering text input states if user navigated away
+    if from_user_id and not data.startswith(("add_bubble_", "edit_bubble_", "add_trig_")):
+        user_wizard_state.pop(from_user_id, None)
+
     async def answer(text: str = "", alert: bool = False):
         await tg_api_call(
             "answerCallbackQuery",
@@ -1385,7 +1386,7 @@ async def handle_callback_query(cq: dict):
         if len(bubbles) <= 1:
             await answer("Cannot remove: At least 1 response bubble is required!", alert=True)
             return
-        removed = bubbles.pop()
+        bubbles.pop()
         acc.custom_messages = bubbles
         acc.custom_message = "\n---\n".join(bubbles)
         await db_manager.save_account(acc)
