@@ -159,6 +159,8 @@ class ConnectedAccount:
     away_mode: bool = False
     away_timeout_minutes: int = 5
     last_owner_activity: Optional[datetime] = None
+    reply_scope: str = "all"  # "all", "first_only", "once_per_day", "once_per_hour"
+    replied_customers: Dict[int, datetime] = field(default_factory=dict)
 
     def get_bubbles(self) -> List[str]:
         if self.custom_messages:
@@ -166,6 +168,55 @@ class ConnectedAccount:
         if self.custom_message:
             return split_message_bubbles(self.custom_message)
         return [DEFAULT_CUSTOM_MESSAGE]
+
+
+def should_reply_to_customer(account: ConnectedAccount, customer_id: int) -> tuple[bool, str]:
+    """
+    Determines if an incoming message should trigger an auto-reply based on reply_scope:
+    - 'all': Always reply to every incoming message from every customer.
+    - 'first_only': Reply only to the very 1st message from each customer (suppress subsequent messages).
+    - 'once_per_day': Reply once every 24 hours per customer.
+    - 'once_per_hour': Reply once every 1 hour per customer.
+    """
+    scope = getattr(account, "reply_scope", "all") or "all"
+    if scope == "all":
+        return True, ""
+
+    last_reply = account.replied_customers.get(customer_id)
+    if not last_reply:
+        return True, ""
+
+    now = datetime.now(timezone.utc)
+    if last_reply.tzinfo is None:
+        last_reply = last_reply.replace(tzinfo=timezone.utc)
+
+    diff_seconds = (now - last_reply).total_seconds()
+
+    if scope == "first_only":
+        return (
+            False,
+            f"Already responded to 1st message on {last_reply.strftime('%Y-%m-%d %H:%M:%S UTC')}. Subsequent DMs ignored as configured.",
+        )
+
+    if scope == "once_per_day":
+        if diff_seconds < 86400:
+            remaining_hours = round((86400 - diff_seconds) / 3600, 1)
+            return (
+                False,
+                f"24h cooldown active ({remaining_hours}h remaining until next auto-reply).",
+            )
+        return True, ""
+
+    if scope == "once_per_hour":
+        if diff_seconds < 3600:
+            remaining_mins = max(1, int((3600 - diff_seconds) / 60))
+            return (
+                False,
+                f"1h cooldown active ({remaining_mins}m remaining until next auto-reply).",
+            )
+        return True, ""
+
+    return True, ""
 
 
 # In-memory dictionary mapping user_id -> ConnectedAccount
@@ -301,6 +352,11 @@ class DatabaseManager:
                 "keyword_matches_count": account.keyword_matches_count,
                 "reply_all_count": account.reply_all_count,
                 "ai_fallbacks_count": account.ai_fallbacks_count,
+                "reply_scope": getattr(account, "reply_scope", "all") or "all",
+                "replied_customers": {
+                    str(k): v.isoformat() if isinstance(v, datetime) else str(v)
+                    for k, v in getattr(account, "replied_customers", {}).items()
+                },
                 "recent_interactions": account.recent_interactions[:50],
                 "updated_at": datetime.now(timezone.utc),
             }
@@ -506,6 +562,16 @@ async def record_account_interaction(
         account.reply_all_count += 1
     elif response_type == "ai_fallback":
         account.ai_fallbacks_count += 1
+
+    # Record customer last reply timestamp for reply_scope enforcement
+    account.replied_customers[customer_id] = datetime.now(timezone.utc)
+    if len(account.replied_customers) > 10000:
+        sorted_keys = sorted(
+            account.replied_customers.keys(),
+            key=lambda k: account.replied_customers[k],
+            reverse=True,
+        )[:10000]
+        account.replied_customers = {k: account.replied_customers[k] for k in sorted_keys}
 
     interaction = {
         "account_id": account.user_id,
@@ -923,6 +989,16 @@ async def process_business_message(message: dict):
     )
 
     # -----------------------------------------------------------------------
+    # Step 0: Reply Scope Enforcement (All Messages vs 1st Message Only vs 24h / 1h)
+    # -----------------------------------------------------------------------
+    should_reply, scope_reason = should_reply_to_customer(account, sender_id)
+    if not should_reply:
+        logger.info(
+            f"[Account @{account.username or account.user_id}] Auto-reply suppressed for {customer_name} ({sender_id}): {scope_reason}"
+        )
+        return
+
+    # -----------------------------------------------------------------------
     # Step A: Keyword Trigger / Conditions Mode (When keyword_triggers is ON)
     # -----------------------------------------------------------------------
     if account.keyword_triggers:
@@ -948,6 +1024,7 @@ async def process_business_message(message: dict):
                 reply_to_message_id=target_reply_id,
             )
             if success:
+                account.replied_customers[sender_id] = datetime.now(timezone.utc)
                 asyncio.create_task(
                     record_account_interaction(
                         account=account,
@@ -977,6 +1054,7 @@ async def process_business_message(message: dict):
                         reply_to_message_id=target_reply_id,
                     )
                     if success:
+                        account.replied_customers[sender_id] = datetime.now(timezone.utc)
                         combined = " \n---\n ".join(bubbles)
                         asyncio.create_task(
                             record_account_interaction(
@@ -1009,6 +1087,7 @@ async def process_business_message(message: dict):
                     reply_to_message_id=target_reply_id,
                 )
                 if success:
+                    account.replied_customers[sender_id] = datetime.now(timezone.utc)
                     asyncio.create_task(
                         record_account_interaction(
                             account=account,
@@ -1037,6 +1116,7 @@ async def process_business_message(message: dict):
                         reply_to_message_id=target_reply_id,
                     )
                     if success:
+                        account.replied_customers[sender_id] = datetime.now(timezone.utc)
                         combined = " \n---\n ".join(bubbles)
                         asyncio.create_task(
                             record_account_interaction(
@@ -1065,6 +1145,7 @@ async def process_business_message(message: dict):
                 reply_to_message_id=target_reply_id,
             )
             if success:
+                account.replied_customers[sender_id] = datetime.now(timezone.utc)
                 combined = " \n---\n ".join(bubbles)
                 asyncio.create_task(
                     record_account_interaction(
@@ -1098,6 +1179,7 @@ async def process_business_message(message: dict):
         reply_to_message_id=target_reply_id,
     )
     if success:
+        account.replied_customers[sender_id] = datetime.now(timezone.utc)
         combined_text = " \n---\n ".join(bubbles)
         asyncio.create_task(
             record_account_interaction(
@@ -1259,6 +1341,22 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
     bubble_count = len(bubbles)
     first_snippet = bubbles[0][:32] + "..." if len(bubbles[0]) > 32 else bubbles[0]
 
+    scope = getattr(acc, "reply_scope", "all") or "all"
+    scope_display_map = {
+        "all": "All Messages (Every DM)",
+        "first_only": "1st Message Only (Once per contact)",
+        "once_per_day": "Once Every 24 Hours",
+        "once_per_hour": "Once Every 1 Hour",
+    }
+    scope_display = scope_display_map.get(scope, "All Messages")
+    scope_btn_map = {
+        "all": "🔁 Scope: All Msgs",
+        "first_only": "🔁 Scope: 1st Msg Only",
+        "once_per_day": "🔁 Scope: 24h Window",
+        "once_per_hour": "🔁 Scope: 1h Window",
+    }
+    scope_btn_text = scope_btn_map.get(scope, "🔁 Scope: All Msgs")
+
     if acc.keyword_triggers:
         mode_str = "🔑 KEYWORD CONDITIONS (Specific replies per keyword)"
         kw_btn_text = "🔑 Keywords: ON"
@@ -1274,12 +1372,14 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
         f"• <b>Status:</b> {status_text}\n"
         f"• <b>Owner Presence:</b> {presence_str}\n"
         f"• <b>Smart Away Mode:</b> {away_status}\n"
+        f"• <b>Reply Scope:</b> {scope_display}\n"
         f"• <b>Active Mode:</b> {mode_str}\n"
         f"• <b>Direct Quote Reply:</b> {quote_status}\n"
         f"• <b>Response Bubbles:</b> {bubble_count} bubble(s) [<i>{html.escape(first_snippet)}</i>]\n"
         f"• <b>AI Fallback:</b> {ai_status}\n"
         f"• <b>AI Model:</b> <code>{html.escape(acc.model)}</code>\n"
         f"• <b>Keyword Conditions:</b> {len(acc.triggers)} active rule(s)\n"
+        f"• <b>Contacts Cached:</b> {len(acc.replied_customers)} contact(s)\n"
         f"• <b>DMs Auto-Responded:</b> {acc.processed_count}\n\n"
         f"<i>Select one of the settings that you want to change:</i>"
     )
@@ -1305,11 +1405,18 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
             {"text": quote_btn_text, "callback_data": f"tog_quote_{acc.user_id}"},
         ],
         [
+            {"text": scope_btn_text, "callback_data": f"cycle_scope_{acc.user_id}"},
             {
-                "text": f"💬 Response Bubbles ({bubble_count})",
+                "text": f"💬 Bubbles ({bubble_count})",
                 "callback_data": f"cust_msg_menu_{acc.user_id}",
             },
+        ],
+        [
             {"text": "📊 Analytics", "callback_data": f"acc_stats_{acc.user_id}"},
+            {
+                "text": f"🔄 Reset Contacts ({len(acc.replied_customers)})",
+                "callback_data": f"reset_contacts_{acc.user_id}",
+            },
         ],
         [
             {"text": "📝 View Triggers", "callback_data": f"view_trig_{acc.user_id}"},
@@ -1567,6 +1674,45 @@ async def handle_callback_query(cq: dict):
                 text, kb = build_bubbles_menu(acc)
             else:
                 text, kb = build_account_settings_menu(acc)
+            await edit(text, kb)
+        return
+
+    # Cycle Reply Scope (All Messages vs 1st Message Only vs 24h vs 1h)
+    if data.startswith("cycle_scope_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if acc:
+            scopes = ["all", "first_only", "once_per_day", "once_per_hour"]
+            curr_scope = getattr(acc, "reply_scope", "all") or "all"
+            curr_idx = scopes.index(curr_scope) if curr_scope in scopes else 0
+            next_scope = scopes[(curr_idx + 1) % len(scopes)]
+            acc.reply_scope = next_scope
+            await db_manager.save_account(acc)
+
+            scope_desc_map = {
+                "all": "All Messages (Every DM triggers auto-reply)",
+                "first_only": "1st Message Only (Replies once per contact, subsequent DMs ignored)",
+                "once_per_day": "Once Every 24 Hours (Replies to 1st DM, then 24h cooldown)",
+                "once_per_hour": "Once Every 1 Hour (Replies to 1st DM, then 1h cooldown)",
+            }
+            await answer(f"Scope set: {scope_desc_map.get(next_scope)}", alert=True)
+            text, kb = build_account_settings_menu(acc)
+            await edit(text, kb)
+        return
+
+    # Reset Replied Contacts Cache
+    if data.startswith("reset_contacts_"):
+        uid = int(data.split("_")[2])
+        acc = accounts.get(uid)
+        if acc:
+            count = len(acc.replied_customers)
+            acc.replied_customers.clear()
+            await db_manager.save_account(acc)
+            await answer(
+                f"Reset Contacts: Cleared {count} contact(s). Bot will reply to their next incoming DM.",
+                alert=True,
+            )
+            text, kb = build_account_settings_menu(acc)
             await edit(text, kb)
         return
 
@@ -2142,6 +2288,24 @@ async def lifespan(app: FastAPI):
         if not custom_msgs:
             custom_msgs = [DEFAULT_CUSTOM_MESSAGE]
 
+        raw_replied = doc.get("replied_customers") or {}
+        replied_map = {}
+        for cid_str, ts_val in raw_replied.items():
+            try:
+                cid = int(cid_str)
+                if isinstance(ts_val, datetime):
+                    replied_map[cid] = ts_val
+                elif isinstance(ts_val, str):
+                    replied_map[cid] = datetime.fromisoformat(ts_val.replace("Z", "+00:00"))
+            except Exception:
+                pass
+
+        if not replied_map:
+            for item in doc.get("recent_interactions", []):
+                cid = item.get("customer_id")
+                if cid and isinstance(cid, int) and cid not in replied_map:
+                    replied_map[cid] = datetime.now(timezone.utc)
+
         acc = ConnectedAccount(
             connection_id=doc.get("connection_id", ""),
             user_id=uid,
@@ -2152,6 +2316,8 @@ async def lifespan(app: FastAPI):
             keyword_triggers=kw_trig,
             trigger_all=not kw_trig,
             quote_reply=doc.get("quote_reply", True),
+            reply_scope=doc.get("reply_scope", "all"),
+            replied_customers=replied_map,
             custom_message=doc.get("custom_message", DEFAULT_CUSTOM_MESSAGE),
             custom_messages=custom_msgs,
             triggers_raw=doc.get("triggers_raw", DEFAULT_TRIGGERS_RAW),
@@ -2312,6 +2478,20 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
             else:
                 mode_pill = '<span class="stat-pill" style="border-color: rgba(56, 189, 248, 0.4); color: #38bdf8;">Mode: <strong>Reply to All DMs</strong></span>'
 
+            scope = getattr(acc, "reply_scope", "all") or "all"
+            scope_map = {
+                "all": "All Messages",
+                "first_only": "1st Msg Only",
+                "once_per_day": "Once / 24h",
+                "once_per_hour": "Once / 1h",
+            }
+            scope_badge = scope_map.get(scope, "All Messages")
+            scope_pill = f'<span class="stat-pill" style="border-color: rgba(168, 85, 247, 0.4); color: #c084fc;">Scope: <strong>{scope_badge}</strong></span>'
+            sel_all = "selected" if scope == "all" else ""
+            sel_first = "selected" if scope == "first_only" else ""
+            sel_24h = "selected" if scope == "once_per_day" else ""
+            sel_1h = "selected" if scope == "once_per_hour" else ""
+
             bubbles = acc.get_bubbles()
 
             # Render dynamic response bubbles HTML
@@ -2410,6 +2590,7 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                     <span class="stat-pill">🤖 AI: <strong>{acc.ai_fallbacks_count}</strong></span>
                     <span class="stat-pill">{presence_pill}</span>
                     {mode_pill}
+                    {scope_pill}
                 </div>
 
                 <form method="POST" action="/account/{user_id}/update" class="account-form">
@@ -2439,6 +2620,16 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                     </div>
 
                     <div class="form-row" style="flex-wrap: wrap; margin-bottom: 16px;">
+                        <div class="form-group" style="flex: 1.5; min-width: 170px;">
+                            <label>Reply Frequency / Scope</label>
+                            <select name="reply_scope" class="form-control" style="font-size: 13px;">
+                                <option value="all" {sel_all}>All Messages (Every DM)</option>
+                                <option value="first_only" {sel_first}>1st Message Only (Once per contact)</option>
+                                <option value="once_per_day" {sel_24h}>Once Every 24 Hours</option>
+                                <option value="once_per_hour" {sel_1h}>Once Every 1 Hour</option>
+                            </select>
+                            <span style="font-size: 10px; color: var(--text-muted); margin-top: 3px; display: block;">Contacts cached: {len(acc.replied_customers)}</span>
+                        </div>
                         <div class="form-group toggle-group" style="flex: 1; min-width: 100px;">
                             <label>Keyword Trigger</label>
                             <label class="switch">
@@ -2477,9 +2668,12 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                         </div>
                     </div>
 
-                    <div class="card-footer" style="margin-bottom: 14px;">
-                        <button type="submit" class="btn btn-primary btn-full" style="padding: 12px; font-size: 14px; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                    <div class="card-footer" style="display: flex; gap: 8px; margin-bottom: 14px;">
+                        <button type="submit" class="btn btn-primary" style="flex: 1; padding: 12px; font-size: 14px; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 8px;">
                             💾 Save @{html.escape(acc.username or str(acc.user_id))} Settings & Messages
+                        </button>
+                        <button type="submit" formaction="/account/{user_id}/reset-contacts" class="btn btn-secondary btn-sm" style="padding: 0 14px; font-size: 12px; white-space: nowrap;" title="Clear contact history so the bot will reply again to 1st messages">
+                            🔄 Reset Contacts ({len(acc.replied_customers)})
                         </button>
                     </div>
                 </form>
@@ -3034,6 +3228,15 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                     <textarea name="triggers" rows="4" class="form-control" style="min-height: 100px;" placeholder="hello:Hi there!, pricing:Our pricing is $10/mo, group:https://t.me/+...">{html.escape(bulk_triggers)}</textarea>
                 </div>
                 <div class="form-row" style="flex-wrap: wrap; margin-bottom: 16px;">
+                    <div class="form-group" style="flex: 1.5; min-width: 170px;">
+                        <label>Reply Frequency / Scope for All Accounts</label>
+                        <select name="reply_scope" class="form-control" style="font-size: 13px;">
+                            <option value="all">All Messages (Every DM)</option>
+                            <option value="first_only">1st Message Only (Once per contact)</option>
+                            <option value="once_per_day">Once Every 24 Hours</option>
+                            <option value="once_per_hour">Once Every 1 Hour</option>
+                        </select>
+                    </div>
                     <div class="form-group toggle-group" style="flex: 1; min-width: 105px;">
                         <label>Keyword Trigger</label>
                         <label class="switch">
@@ -3166,6 +3369,12 @@ async def health_check():
             "quote_reply_active": sum(1 for a in accounts.values() if a.quote_reply),
             "keyword_triggers_active": sum(1 for a in accounts.values() if a.keyword_triggers),
             "reply_all_active": sum(1 for a in accounts.values() if not a.keyword_triggers),
+            "reply_scope_breakdown": {
+                "all": sum(1 for a in accounts.values() if getattr(a, "reply_scope", "all") == "all"),
+                "first_only": sum(1 for a in accounts.values() if getattr(a, "reply_scope", "all") == "first_only"),
+                "once_per_day": sum(1 for a in accounts.values() if getattr(a, "reply_scope", "all") == "once_per_day"),
+                "once_per_hour": sum(1 for a in accounts.values() if getattr(a, "reply_scope", "all") == "once_per_hour"),
+            },
             "total_triggers_configured": total_triggers,
             "openrouter_status": "READY" if OPENROUTER_API_KEY else "NOT_CONFIGURED",
         },
@@ -3202,6 +3411,9 @@ async def bulk_update_accounts(request: Request):
     quote_reply = "quote_reply" in data
     ai_fallback = "ai_fallback" in data
     away_mode = "away_mode" in data
+    reply_scope = data.get("reply_scope", ["all"])[0].strip() or "all"
+    if reply_scope not in ("all", "first_only", "once_per_day", "once_per_hour"):
+        reply_scope = "all"
     model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
     parsed_rules = parse_triggers(triggers_raw)
 
@@ -3215,13 +3427,14 @@ async def bulk_update_accounts(request: Request):
         acc.quote_reply = quote_reply
         acc.ai_fallback = ai_fallback
         acc.away_mode = away_mode
+        acc.reply_scope = reply_scope
         acc.model = model
         # Persist to MongoDB
         await db_manager.save_account(acc)
 
     logger.info(
         f"Bulk update executed: applied {len(parsed_rules)} triggers, {len(bubble_list)} bubble(s), "
-        f"quote_reply={quote_reply}, keyword_triggers={keyword_triggers}, AI fallback={ai_fallback}, model='{model}' across {len(accounts)} accounts."
+        f"scope='{reply_scope}', quote_reply={quote_reply}, keyword_triggers={keyword_triggers}, AI fallback={ai_fallback}, model='{model}' across {len(accounts)} accounts."
     )
     return RedirectResponse(
         url="/?msg=All+connected+accounts+synchronized+successfully", status_code=303
@@ -3261,15 +3474,43 @@ async def update_account_config(user_id: int, request: Request):
     acc.quote_reply = "quote_reply" in data
     acc.ai_fallback = "ai_fallback" in data
     acc.away_mode = "away_mode" in data
+    reply_scope = data.get("reply_scope", ["all"])[0].strip() or "all"
+    if reply_scope not in ("all", "first_only", "once_per_day", "once_per_hour"):
+        reply_scope = "all"
+    acc.reply_scope = reply_scope
     acc.model = data.get("model", [DEFAULT_MODEL])[0].strip() or DEFAULT_MODEL
 
     # Persist to MongoDB
     await db_manager.save_account(acc)
 
     logger.info(
-        f"[Account @{acc.username or user_id}] Updated: keyword_triggers={acc.keyword_triggers}, "
+        f"[Account @{acc.username or user_id}] Updated: scope='{acc.reply_scope}', keyword_triggers={acc.keyword_triggers}, "
         f"quote_reply={acc.quote_reply}, bubbles={len(acc.custom_messages)}, {len(acc.triggers)} triggers, "
         f"AI fallback={acc.ai_fallback}, model='{acc.model}'"
+    )
+    return RedirectResponse(
+        url=f"/?msg=Settings+and+messages+saved+successfully+for+@{html.escape(acc.username or str(user_id))}",
+        status_code=303,
+    )
+
+
+@app.post("/account/{user_id}/reset-contacts")
+async def reset_account_contacts(user_id: int):
+    """
+    Clears the replied contacts cache for an account so it will reply again to 1st messages.
+    """
+    if user_id not in accounts:
+        return RedirectResponse(
+            url="/?err=Invalid+account+identifier", status_code=303
+        )
+    acc = accounts[user_id]
+    count = len(acc.replied_customers)
+    acc.replied_customers.clear()
+    await db_manager.save_account(acc)
+    logger.info(f"[Account @{acc.username or user_id}] Cleared {count} replied contact(s).")
+    return RedirectResponse(
+        url=f"/?msg=Contact+history+reset+({count}+contacts+cleared)+for+@{html.escape(acc.username or str(user_id))}",
+        status_code=303,
     )
     return RedirectResponse(
         url=f"/?msg=Settings+and+messages+saved+successfully+for+@{html.escape(acc.username or str(user_id))}",
