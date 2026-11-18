@@ -50,6 +50,11 @@ Runs seamlessly on the **Render Free Tier** (0.1 vCPU, 500MB RAM) with an ultra-
    - Restores all accounts into a fast in-memory cache on startup for sub-millisecond response latency.
 10. **Real-Time Web Dashboard**:
    - Served directly on root `GET /` with live status indicators, dynamic bubble manager, enlarged textareas, prominent `💾 Save Settings & Messages` button, and bulk synchronization tools.
+11. **Strict Member Isolation & Privacy Gate**:
+   - Each Telegram user who adds the bot to their profile can **strictly view and configure only their own account**.
+   - When an account owner sends `/settings`, `/start`, or `/menu`, the bot directly opens **their personal settings panel**—other connected accounts are completely hidden.
+   - Non-linked users receive friendly onboarding instructions and cannot view or alter anyone's account.
+   - All inline button actions and wizard inputs are verified against the caller's Telegram User ID (`from_user_id == target_account_id`), instantly blocking unauthorized tampering.
 
 ---
 

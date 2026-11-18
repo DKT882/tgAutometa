@@ -1427,8 +1427,7 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
             {"text": "🔄 Reload", "callback_data": f"acc_{acc.user_id}"},
         ],
         [
-            {"text": "⬅️ Back", "callback_data": "back_to_accounts"},
-            {"text": "✅ Close", "callback_data": "close_menu"},
+            {"text": "✅ Close Menu", "callback_data": "close_menu"},
         ],
     ]
 
@@ -1482,9 +1481,51 @@ def build_bubbles_menu(acc: ConnectedAccount) -> tuple[str, list]:
     return text, kb
 
 
+def extract_callback_target_account_id(data: str) -> Optional[int]:
+    """
+    Extracts the target user_id from callback_data string for security and ownership verification.
+    """
+    prefixes = [
+        "acc_",
+        "tog_ai_",
+        "tog_act_",
+        "tog_away_",
+        "away_time_",
+        "tog_kw_",
+        "tog_trig_all_",
+        "tog_quote_sub_",
+        "tog_quote_",
+        "cycle_scope_",
+        "reset_contacts_",
+        "cust_msg_menu_",
+        "acc_stats_",
+        "view_trig_",
+        "add_trig_",
+        "reset_trig_",
+        "pick_mod_",
+        "setmod_",
+        "add_bubble_",
+        "rem_bubble_",
+        "edit_bubble_",
+        "test_preview_",
+        "reset_cust_msg_",
+        "check_conn_",
+    ]
+    for p in prefixes:
+        if data.startswith(p):
+            sub = data[len(p):]
+            part = sub.split("_")[0]
+            try:
+                return int(part)
+            except ValueError:
+                return None
+    return None
+
+
 async def handle_callback_query(cq: dict):
     """
     Processes all inline button clicks inside Telegram DM wizard.
+    Enforces strict account ownership so members can only configure their own accounts.
     """
     cq_id = cq["id"]
     from_user = cq.get("from", {})
@@ -1515,6 +1556,18 @@ async def handle_callback_query(cq: dict):
             },
         )
 
+    # -----------------------------------------------------------------------
+    # Security Gate: Ensure members can ONLY view/edit their OWN account
+    # -----------------------------------------------------------------------
+    target_uid = extract_callback_target_account_id(data)
+    if target_uid is not None and from_user_id:
+        if from_user_id != target_uid:
+            logger.warning(
+                f"[Security] User {from_user_id} attempted unauthorized access to account {target_uid} (data='{data}'). Blocked."
+            )
+            await answer("⛔ Access denied! You can only configure settings for your own Telegram account.", alert=True)
+            return
+
     if data == "noop":
         await answer()
         return
@@ -1527,9 +1580,76 @@ async def handle_callback_query(cq: dict):
         return
 
     if data in ("back_to_accounts", "refresh_list"):
-        text, kb = build_accounts_menu()
-        await edit(text, kb)
-        await answer("List updated.")
+        if from_user_id in accounts:
+            user_acc = accounts[from_user_id]
+            text, kb = build_account_settings_menu(user_acc)
+            await edit(text, kb)
+            await answer("Settings refreshed.")
+        else:
+            bot_name = html.escape(bot_info.get("username", "this bot"))
+            menu_text = (
+                f"👋 <b>Welcome!</b>\n\n"
+                f"⚠️ <b>You have not connected @{bot_name} to your Telegram Business profile yet.</b>\n\n"
+                f"📌 <b>To set up automated replies for your own chat:</b>\n"
+                f"1. Open your Telegram app <b>Settings</b> ➔ <b>Telegram Business</b> ➔ <b>Chatbots</b>\n"
+                f"2. Add <code>@{bot_name}</code>\n"
+                f"3. Check the box <b>'Reply to messages'</b> and save.\n"
+                f"4. Return here and tap <b>'🔄 Connect & Open My Settings'</b> below!\n\n"
+                f"🔒 <i>Privacy & Security: You can only configure auto-replies for your own chat/account.</i>"
+            )
+            menu_kb = [
+                [
+                    {
+                        "text": "🔄 Connect & Open My Settings",
+                        "callback_data": f"check_conn_{from_user_id}",
+                    }
+                ],
+                [
+                    {
+                        "text": "ℹ️ Help & Instructions",
+                        "callback_data": "help_info",
+                    }
+                ],
+            ]
+            await edit(menu_text, menu_kb)
+            await answer()
+        return
+
+    if data.startswith("check_conn_"):
+        if from_user_id in accounts:
+            user_acc = accounts[from_user_id]
+            text, kb = build_account_settings_menu(user_acc)
+            await edit(text, kb)
+            await answer("✅ Account verified! Opened your settings.", alert=True)
+        else:
+            bot_name = html.escape(bot_info.get("username", "this bot"))
+            await answer(
+                f"Bot @{bot_name} is not added in your Telegram Business chatbots yet. Add it under Settings ➔ Telegram Business ➔ Chatbots first!",
+                alert=True,
+            )
+        return
+
+    if data == "help_info":
+        bot_name = html.escape(bot_info.get("username", "this bot"))
+        h_text = (
+            f"ℹ️ <b>How to link @{bot_name} to your Telegram:</b>\n\n"
+            f"1. Open Telegram <b>Settings</b> ➔ <b>Telegram Business</b> ➔ <b>Chatbots</b>\n"
+            f"2. Add <code>@{bot_name}</code>\n"
+            f"3. Enable <b>'Reply to messages'</b>\n"
+            f"4. Send /settings to open your personal auto-reply manager!\n\n"
+            f"💡 <i>Once linked, you can set custom response bubbles, keyword conditions, away mode, reply frequency, and link previews.</i>"
+        )
+        h_kb = [
+            [
+                {
+                    "text": "🔄 Check Connection",
+                    "callback_data": f"check_conn_{from_user_id}",
+                }
+            ],
+            [{"text": "❌ Close", "callback_data": "close_menu"}],
+        ]
+        await edit(h_text, h_kb)
+        await answer()
         return
 
     if data == "sys_stats":
@@ -2104,6 +2224,11 @@ async def run_bot_polling():
                         state = user_wizard_state.pop(from_user_id)
                         action = state.get("action")
                         target_id = state.get("target_account_id")
+                        if from_user_id != target_id:
+                            logger.warning(
+                                f"[Security] User {from_user_id} tried wizard text input for account {target_id}. Blocked."
+                            )
+                            continue
                         acc = accounts.get(target_id)
 
                         # Awaiting new response bubble
@@ -2222,7 +2347,38 @@ async def run_bot_polling():
 
                     # Commands
                     if text.startswith(("/start", "/settings", "/menu")):
-                        menu_text, menu_kb = build_accounts_menu()
+                        if from_user_id in accounts:
+                            # User linked this bot in their Telegram profile: open THEIR OWN settings directly!
+                            user_acc = accounts[from_user_id]
+                            menu_text, menu_kb = build_account_settings_menu(user_acc)
+                        else:
+                            # User has not connected this bot yet: show onboarding instructions
+                            bot_name = html.escape(bot_info.get("username", "this bot"))
+                            caller_name = html.escape(from_user.get("first_name", "there"))
+                            menu_text = (
+                                f"👋 <b>Welcome {caller_name}!</b>\n\n"
+                                f"⚠️ <b>You have not connected @{bot_name} to your Telegram Business profile yet.</b>\n\n"
+                                f"📌 <b>To set up automated replies for your own chat:</b>\n"
+                                f"1. Open your Telegram app <b>Settings</b> ➔ <b>Telegram Business</b> ➔ <b>Chatbots</b>\n"
+                                f"2. Add <code>@{bot_name}</code>\n"
+                                f"3. Check the box <b>'Reply to messages'</b> and save.\n"
+                                f"4. Return here and tap <b>'🔄 Connect & Open My Settings'</b> below!\n\n"
+                                f"🔒 <i>Privacy & Security: You can only configure auto-replies for your own chat/account.</i>"
+                            )
+                            menu_kb = [
+                                [
+                                    {
+                                        "text": "🔄 Connect & Open My Settings",
+                                        "callback_data": f"check_conn_{from_user_id}",
+                                    }
+                                ],
+                                [
+                                    {
+                                        "text": "ℹ️ Help & Instructions",
+                                        "callback_data": "help_info",
+                                    }
+                                ],
+                            ]
                         await tg_api_call(
                             "sendMessage",
                             {
@@ -2233,14 +2389,15 @@ async def run_bot_polling():
                             },
                         )
                     elif text.startswith("/help"):
+                        bot_name = html.escape(bot_info.get("username", "this bot"))
                         help_text = (
-                            f"👋 <b>Welcome to Multi-Account AutoResponder!</b>\n\n"
+                            f"👋 <b>Welcome to Personal AutoResponder!</b>\n\n"
                             f"📌 <b>Connect your Telegram Account:</b>\n"
                             f"1. Open Telegram <b>Settings</b> ➔ <b>Telegram Business</b> ➔ <b>Chatbots</b>\n"
-                            f"2. Add @{bot_info.get('username')}\n"
+                            f"2. Add @{bot_name}\n"
                             f"3. Enable <b>'Reply to messages'</b>\n\n"
-                            f"⚙️ Send /settings to open your interactive management wizard!\n"
-                            f"🌐 You can also configure everything via your web dashboard."
+                            f"⚙️ Send /settings to open your personal interactive management wizard!\n"
+                            f"🔒 <i>Privacy Guarantee: You can only view and customize auto-replies for your own chat.</i>"
                         )
                         await tg_api_call(
                             "sendMessage",
