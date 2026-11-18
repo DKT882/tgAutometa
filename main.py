@@ -367,7 +367,10 @@ class DatabaseManager:
                 }
             )
             reply_all = await self.logs_col.count_documents(
-                {"account_id": account_id, "response_type": "all_messages_custom"}
+                {
+                    "account_id": account_id,
+                    "response_type": {"$in": ["all_messages_custom", "media_custom_reply"]},
+                }
             )
             ai = await self.logs_col.count_documents(
                 {"account_id": account_id, "response_type": "ai_fallback"}
@@ -445,7 +448,11 @@ class DatabaseManager:
                 {"response_type": {"$in": ["keyword_trigger", "trigger"]}}
             )
             reply_all_count = await self.logs_col.count_documents(
-                {"response_type": "all_messages_custom"}
+                {
+                    "response_type": {
+                        "$in": ["all_messages_custom", "media_custom_reply"]
+                    }
+                }
             )
             ai_count = await self.logs_col.count_documents(
                 {"response_type": "ai_fallback"}
@@ -495,7 +502,7 @@ async def record_account_interaction(
     account.processed_count += 1
     if response_type in ("keyword_trigger", "trigger"):
         account.keyword_matches_count += 1
-    elif response_type == "all_messages_custom":
+    elif response_type in ("all_messages_custom", "media_custom_reply"):
         account.reply_all_count += 1
     elif response_type == "ai_fallback":
         account.ai_fallbacks_count += 1
@@ -709,10 +716,151 @@ async def generate_openrouter_reply(user_message: str, model: str) -> Optional[s
 # ---------------------------------------------------------------------------
 # Business Message Processing Pipeline (Multi-Bubble + Reply-To + Analytics)
 # ---------------------------------------------------------------------------
+def extract_message_content(message: dict) -> tuple[str, str, str]:
+    """
+    Extracts display text, search/matching text, and media type from any incoming Telegram message.
+    Supports pure text, stickers, GIFs/animations, photos, videos, voice notes, video notes,
+    audio, documents, contacts, locations, and dice.
+    Returns: (display_text, search_text, media_type)
+    """
+    caption = (message.get("caption") or "").strip()
+
+    # 1. Text message
+    if "text" in message and message["text"]:
+        text = message["text"].strip()
+        return text, text, "text"
+
+    # 2. Sticker
+    if "sticker" in message and message["sticker"]:
+        sticker = message["sticker"]
+        emoji = sticker.get("emoji", "").strip()
+        set_name = sticker.get("set_name", "").strip()
+        display = f"[Sticker {emoji}]" if emoji else "[Sticker]"
+        search_terms = ["sticker"]
+        if emoji:
+            search_terms.append(emoji)
+        if set_name:
+            search_terms.append(set_name)
+        return display, " ".join(search_terms), "sticker"
+
+    # 3. Animation / GIF
+    if "animation" in message and message["animation"]:
+        display = f"[GIF] {caption}".strip() if caption else "[GIF / Animation]"
+        search_terms = ["gif", "animation"]
+        if caption:
+            search_terms.append(caption)
+        return display, " ".join(search_terms), "gif"
+
+    # 4. Photo
+    if "photo" in message and message["photo"]:
+        display = f"[Photo] {caption}".strip() if caption else "[Photo]"
+        search_terms = ["photo", "image", "pic", "picture"]
+        if caption:
+            search_terms.append(caption)
+        return display, " ".join(search_terms), "photo"
+
+    # 5. Video
+    if "video" in message and message["video"]:
+        display = f"[Video] {caption}".strip() if caption else "[Video]"
+        search_terms = ["video", "clip"]
+        if caption:
+            search_terms.append(caption)
+        return display, " ".join(search_terms), "video"
+
+    # 6. Voice Note
+    if "voice" in message and message["voice"]:
+        display = f"[Voice Note] {caption}".strip() if caption else "[Voice Note]"
+        search_terms = ["voice", "voice note", "audio"]
+        if caption:
+            search_terms.append(caption)
+        return display, " ".join(search_terms), "voice"
+
+    # 7. Video Note (round video)
+    if "video_note" in message and message["video_note"]:
+        return "[Video Note]", "video note round video", "video_note"
+
+    # 8. Audio
+    if "audio" in message and message["audio"]:
+        audio = message["audio"]
+        title = audio.get("title", "").strip()
+        performer = audio.get("performer", "").strip()
+        label_parts = [p for p in [performer, title] if p]
+        desc = " - ".join(label_parts) if label_parts else caption
+        display = f"[Audio: {desc}]" if desc else "[Audio]"
+        search_terms = ["audio", "music", "song"]
+        if title:
+            search_terms.append(title)
+        if performer:
+            search_terms.append(performer)
+        if caption:
+            search_terms.append(caption)
+        return display, " ".join(search_terms), "audio"
+
+    # 9. Document
+    if "document" in message and message["document"]:
+        doc = message["document"]
+        file_name = doc.get("file_name", "").strip()
+        mime_type = (doc.get("mime_type") or "").lower()
+        if "gif" in mime_type:
+            display = f"[GIF] {caption}".strip() if caption else "[GIF / Animation]"
+            search_terms = ["gif", "animation"]
+            if caption:
+                search_terms.append(caption)
+            return display, " ".join(search_terms), "gif"
+
+        display = (
+            f"[Document: {file_name}] {caption}".strip()
+            if file_name
+            else (f"[Document] {caption}".strip() if caption else "[Document]")
+        )
+        search_terms = ["document", "file"]
+        if file_name:
+            search_terms.append(file_name)
+        if caption:
+            search_terms.append(caption)
+        return display, " ".join(search_terms), "document"
+
+    # 10. Contact
+    if "contact" in message and message["contact"]:
+        c = message["contact"]
+        name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip() or "Contact"
+        phone = c.get("phone_number", "").strip()
+        display = f"[Contact: {name}]"
+        search_terms = ["contact", name]
+        if phone:
+            search_terms.append(phone)
+        return display, " ".join(search_terms), "contact"
+
+    # 11. Location / Venue
+    if "location" in message or "venue" in message:
+        venue = message.get("venue", {})
+        title = venue.get("title", "").strip() if venue else ""
+        display = f"[Venue: {title}]" if title else "[Location]"
+        search_terms = ["location", "venue", "map"]
+        if title:
+            search_terms.append(title)
+        return display, " ".join(search_terms), "location"
+
+    # 12. Dice
+    if "dice" in message and message["dice"]:
+        dice = message["dice"]
+        emoji = dice.get("emoji", "🎲")
+        val = dice.get("value", "")
+        return f"[Dice {emoji} {val}]", f"dice {emoji}", "dice"
+
+    # 13. Fallback for any other media with caption
+    if caption:
+        return f"[Media] {caption}", f"media {caption}", "media"
+
+    # 14. Unknown or generic media
+    return "[Media]", "media", "media"
+
+
 async def process_business_message(message: dict):
     """
     Handles incoming private DMs sent to any connected business account.
-    Supports multi-response sequences and direct quote replies.
+    Supports pure text, stickers, GIFs/animations, photos, videos, voice notes, and media.
+    Routes multi-response sequences and direct quote replies across all formats.
     """
     connection_id = message.get("business_connection_id")
     if not connection_id:
@@ -753,8 +901,11 @@ async def process_business_message(message: dict):
         return
 
     chat_id = message.get("chat", {}).get("id")
-    raw_text = (message.get("text") or message.get("caption") or "").strip()
-    if not raw_text or not chat_id:
+    if not chat_id:
+        return
+
+    display_text, search_text, media_type = extract_message_content(message)
+    if not display_text and not search_text:
         return
 
     incoming_msg_id = message.get("message_id")
@@ -768,14 +919,14 @@ async def process_business_message(message: dict):
     )
 
     logger.info(
-        f"[Account @{account.username or account.user_id}] Incoming DM from {customer_name}: '{raw_text[:50]}...'"
+        f"[Account @{account.username or account.user_id}] Incoming {media_type} DM from {customer_name}: '{display_text[:50]}...'"
     )
 
     # -----------------------------------------------------------------------
     # Step A: Keyword Trigger / Conditions Mode (When keyword_triggers is ON)
     # -----------------------------------------------------------------------
     if account.keyword_triggers:
-        text_lower = raw_text.lower()
+        text_lower = search_text.lower()
         matched_reply: Optional[str] = None
         matched_keyword: Optional[str] = None
 
@@ -802,7 +953,7 @@ async def process_business_message(message: dict):
                         account=account,
                         customer_id=sender_id,
                         customer_name=customer_name,
-                        incoming_text=raw_text,
+                        incoming_text=display_text,
                         response_type="keyword_trigger",
                         response_text=matched_reply,
                         matched_keyword=matched_keyword,
@@ -817,13 +968,39 @@ async def process_business_message(message: dict):
                 logger.warning(
                     f"[Account @{account.username or account.user_id}] AI Fallback requested, but OPENROUTER_API_KEY is not set."
                 )
+                if media_type != "text":
+                    bubbles = account.get_bubbles()
+                    success = await send_business_messages_sequence(
+                        account.connection_id,
+                        chat_id,
+                        bubbles,
+                        reply_to_message_id=target_reply_id,
+                    )
+                    if success:
+                        combined = " \n---\n ".join(bubbles)
+                        asyncio.create_task(
+                            record_account_interaction(
+                                account=account,
+                                customer_id=sender_id,
+                                customer_name=customer_name,
+                                incoming_text=display_text,
+                                response_type="media_custom_reply",
+                                response_text=combined,
+                                matched_keyword=f"[{media_type.upper()}]",
+                            )
+                        )
                 return
 
             logger.info(
-                f"[Account @{account.username or account.user_id}] No keyword condition matched. Initiating AI fallback (model: {account.model})."
+                f"[Account @{account.username or account.user_id}] No keyword condition matched. Initiating AI fallback for {media_type} (model: {account.model})."
             )
             await send_typing_indicator(account.connection_id, chat_id)
-            ai_reply = await generate_openrouter_reply(raw_text, account.model)
+            ai_prompt = (
+                f"Customer sent a {media_type} message: {display_text}"
+                if media_type != "text"
+                else display_text
+            )
+            ai_reply = await generate_openrouter_reply(ai_prompt, account.model)
             if ai_reply:
                 success = await send_business_messages_sequence(
                     account.connection_id,
@@ -837,7 +1014,7 @@ async def process_business_message(message: dict):
                             account=account,
                             customer_id=sender_id,
                             customer_name=customer_name,
-                            incoming_text=raw_text,
+                            incoming_text=display_text,
                             response_type="ai_fallback",
                             response_text=ai_reply,
                             ai_model=account.model,
@@ -846,13 +1023,62 @@ async def process_business_message(message: dict):
                     logger.info(
                         f"[Account @{account.username or account.user_id}] AI reply delivered to sender {sender_id}."
                     )
+                return
             else:
                 logger.warning(
                     f"[Account @{account.username or account.user_id}] AI generation returned empty content."
                 )
+                if media_type != "text":
+                    bubbles = account.get_bubbles()
+                    success = await send_business_messages_sequence(
+                        account.connection_id,
+                        chat_id,
+                        bubbles,
+                        reply_to_message_id=target_reply_id,
+                    )
+                    if success:
+                        combined = " \n---\n ".join(bubbles)
+                        asyncio.create_task(
+                            record_account_interaction(
+                                account=account,
+                                customer_id=sender_id,
+                                customer_name=customer_name,
+                                incoming_text=display_text,
+                                response_type="media_custom_reply",
+                                response_text=combined,
+                                matched_keyword=f"[{media_type.upper()}]",
+                            )
+                        )
+                return
+
+        # If keyword_triggers is ON, no keyword matched, and AI is OFF:
+        # For non-text media (stickers, GIFs, photos, voice notes, etc.), reply with custom bubbles
+        if media_type != "text":
+            bubbles = account.get_bubbles()
+            logger.info(
+                f"[Account @{account.username or account.user_id}] Incoming {media_type} (no keyword match, AI off). Replying with custom response sequence."
+            )
+            success = await send_business_messages_sequence(
+                account.connection_id,
+                chat_id,
+                bubbles,
+                reply_to_message_id=target_reply_id,
+            )
+            if success:
+                combined = " \n---\n ".join(bubbles)
+                asyncio.create_task(
+                    record_account_interaction(
+                        account=account,
+                        customer_id=sender_id,
+                        customer_name=customer_name,
+                        incoming_text=display_text,
+                        response_type="media_custom_reply",
+                        response_text=combined,
+                        matched_keyword=f"[{media_type.upper()}]",
+                    )
+                )
             return
 
-        # If keyword_triggers is ON and no keyword matched and AI is OFF -> do not reply
         logger.info(
             f"[Account @{account.username or account.user_id}] Keyword Trigger is ON, but incoming DM did not match any keyword conditions. Ignored."
         )
@@ -863,7 +1089,7 @@ async def process_business_message(message: dict):
     # -----------------------------------------------------------------------
     bubbles = account.get_bubbles()
     logger.info(
-        f"[Account @{account.username or account.user_id}] Keyword Trigger is OFF. Replying with {len(bubbles)} sequential response bubble(s)."
+        f"[Account @{account.username or account.user_id}] Keyword Trigger is OFF. Replying to incoming {media_type} with {len(bubbles)} sequential response bubble(s)."
     )
     success = await send_business_messages_sequence(
         account.connection_id,
@@ -878,7 +1104,7 @@ async def process_business_message(message: dict):
                 account=account,
                 customer_id=sender_id,
                 customer_name=customer_name,
-                incoming_text=raw_text,
+                incoming_text=display_text,
                 response_type="all_messages_custom",
                 response_text=combined_text,
                 matched_keyword="[ALL_MESSAGES]",
@@ -1634,7 +1860,11 @@ async def handle_callback_query(cq: dict):
                 badge = (
                     "🔑 Keyword"
                     if "keyword" in rtype
-                    else ("💬 Reply-All" if "all" in rtype else "🤖 AI")
+                    else (
+                        "💬 Reply-All"
+                        if "all" in rtype
+                        else ("🖼️ Media" if "media" in rtype else "🤖 AI")
+                    )
                 )
                 stat_text += (
                     f"{i}. 👤 <b>{c_name}</b> ({badge})\n"
@@ -2119,8 +2349,28 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                     out_text = html.escape(str(r.get("response_text", ""))[:80])
                     ts_str = html.escape(str(r.get("timestamp", ""))[-12:])
                     rtype = r.get("response_type", "")
-                    badge_style = "background: rgba(74, 222, 128, 0.15); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.3);" if "keyword" in rtype else ("background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);" if "all" in rtype else "background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3);")
-                    badge_name = "Keyword" if "keyword" in rtype else ("Reply-All" if "all" in rtype else "AI")
+                    badge_style = (
+                        "background: rgba(74, 222, 128, 0.15); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.3);"
+                        if "keyword" in rtype
+                        else (
+                            "background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3);"
+                            if "all" in rtype
+                            else (
+                                "background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3);"
+                                if "media" in rtype
+                                else "background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3);"
+                            )
+                        )
+                    )
+                    badge_name = (
+                        "Keyword"
+                        if "keyword" in rtype
+                        else (
+                            "Reply-All"
+                            if "all" in rtype
+                            else ("Media" if "media" in rtype else "AI")
+                        )
+                    )
                     audit_log_html += f"""
                     <div style="background: #0d121c; border: 1px solid var(--border-color); border-radius: 6px; padding: 8px 10px; font-size: 12px;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">

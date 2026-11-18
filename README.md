@@ -25,19 +25,24 @@ Runs seamlessly on the **Render Free Tier** (0.1 vCPU, 500MB RAM) with an ultra-
    - **Keyword Trigger ON**: Checks conditions (different keywords ➔ different replies). When an incoming DM contains a configured keyword (e.g. `pricing`, `help`, `link`), it sends that keyword's specific reply sequence (with rich preview cards for links). Non-matching DMs are ignored cleanly.
    - **Keyword Trigger OFF**: Replies to **ALL incoming DMs** with the **Customized Response Bubbles** (with rich link previews for `https://t.me/...`), no matter what keyword or text the sender typed!
    - Toggleable directly in the Telegram DM wizard (`[🔑 Keywords: ON/OFF]`) or the Web Dashboard.
-5. **Smart Away Mode (Auto-Offline Detection)**:
+5. **Universal Media & Sticker Auto-Reply**:
+   - Seamlessly responds to **stickers**, **GIFs / animations**, **photos**, **videos**, **voice notes**, **video notes**, **audio**, **documents**, and **contacts**.
+   - In **Reply-All mode**: Automatically responds to any incoming media with configured sequential response bubbles, quoting the customer's sticker or media.
+   - In **Keyword mode**: Matches conditions against sticker emojis, captions, filenames, or media tags. If no keyword matches, it leverages AI Fallback or delivers the customized response sequence so media interactions are never ignored.
+   - Displays clean labels in live interaction logs: `[Sticker 👍]`, `[GIF / Animation]`, `[Photo]`, `[Voice Note]`, etc., with dedicated badges on the Web Dashboard and Telegram DM wizard.
+6. **Smart Away Mode (Auto-Offline Detection)**:
    - When the user is **actively chatting** on their Telegram account, the bot automatically **deactivates** so it never speaks over the human.
    - When the user goes **offline / idle** (e.g. no messages sent for > 5 minutes), the bot automatically **activates** and manages all incoming DMs!
    - Fully toggleable ON/OFF per account with adjustable inactivity timeouts (2m, 5m, 10m, 15m).
-6. **Live Analytics & Customer Interaction Audit Log**:
+7. **Live Analytics & Customer Interaction Audit Log**:
    - Detailed telemetry tracking: Total DMs responded, Keyword Matches, Reply-All Custom Replies, and AI Fallbacks.
    - Rolling in-memory and MongoDB audit log of recent customer interactions (customer handle, incoming text, bot reply bubbles, response type, timestamp).
    - Works seamlessly with or without an active MongoDB connection.
-7. **Database Persistence (MongoDB with In-Memory Fallback)**:
+8. **Database Persistence (MongoDB with In-Memory Fallback)**:
    - Built using non-blocking async **Motor** (`motor.motor_asyncio`).
    - Persists all account configurations, response bubbles, custom triggers, AI model selections, and audit message logs.
    - Restores all accounts into a fast in-memory cache on startup for sub-millisecond response latency.
-8. **Real-Time Web Dashboard**:
+9. **Real-Time Web Dashboard**:
    - Served directly on root `GET /` with live status indicators, dynamic bubble manager, enlarged textareas, prominent `💾 Save Settings & Messages` button, and bulk synchronization tools.
 
 ---
