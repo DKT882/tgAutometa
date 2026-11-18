@@ -14,7 +14,7 @@ import sys
 import urllib.parse
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import motor.motor_asyncio
@@ -88,6 +88,25 @@ user_wizard_state: Dict[int, Dict[str, Any]] = {}
 # ---------------------------------------------------------------------------
 # Rule & Bubble Parsing Utilities
 # ---------------------------------------------------------------------------
+def ensure_utc(dt: Optional[Union[datetime, str]]) -> Optional[datetime]:
+    """
+    Safely normalize any datetime or ISO string to an offset-aware UTC datetime.
+    Handles naive datetimes from MongoDB BSON deserialization or aware datetimes.
+    """
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def split_message_bubbles(content: str) -> List[str]:
     """
     Splits message content into discrete response bubbles.
@@ -162,6 +181,14 @@ class ConnectedAccount:
     reply_scope: str = "all"  # "all", "first_only", "once_per_day", "once_per_hour"
     replied_customers: Dict[int, datetime] = field(default_factory=dict)
 
+    def __post_init__(self):
+        if self.last_owner_activity is not None:
+            self.last_owner_activity = ensure_utc(self.last_owner_activity)
+        if self.replied_customers:
+            self.replied_customers = {
+                k: ensure_utc(v) or v for k, v in self.replied_customers.items()
+            }
+
     def get_bubbles(self) -> List[str]:
         if self.custom_messages:
             return [b for b in self.custom_messages if b.strip()]
@@ -182,14 +209,11 @@ def should_reply_to_customer(account: ConnectedAccount, customer_id: int) -> tup
     if scope == "all":
         return True, ""
 
-    last_reply = account.replied_customers.get(customer_id)
+    last_reply = ensure_utc(account.replied_customers.get(customer_id))
     if not last_reply:
         return True, ""
 
     now = datetime.now(timezone.utc)
-    if last_reply.tzinfo is None:
-        last_reply = last_reply.replace(tzinfo=timezone.utc)
-
     diff_seconds = (now - last_reply).total_seconds()
 
     if scope == "first_only":
@@ -949,9 +973,10 @@ async def process_business_message(message: dict):
         return
 
     # Smart Away Mode: Suppress bot response when the account owner is active
-    if account.away_mode and account.last_owner_activity:
+    owner_act = ensure_utc(account.last_owner_activity)
+    if account.away_mode and owner_act:
         idle_seconds = (
-            datetime.now(timezone.utc) - account.last_owner_activity
+            datetime.now(timezone.utc) - owner_act
         ).total_seconds()
         timeout_seconds = account.away_timeout_minutes * 60
         if idle_seconds < timeout_seconds:
@@ -1326,11 +1351,12 @@ def build_account_settings_menu(acc: ConnectedAccount) -> tuple[str, list]:
         else "❌ DISABLED (Standalone bubble)"
     )
 
-    if not acc.last_owner_activity:
+    owner_act = ensure_utc(acc.last_owner_activity)
+    if not owner_act:
         presence_str = "💤 OFFLINE (No recent outgoing DMs)"
     else:
         idle_s = int(
-            (datetime.now(timezone.utc) - acc.last_owner_activity).total_seconds()
+            (datetime.now(timezone.utc) - owner_act).total_seconds()
         )
         if idle_s < (acc.away_timeout_minutes * 60):
             presence_str = f"🟢 ONLINE (Active {int(idle_s / 60)}m ago)"
@@ -2085,11 +2111,12 @@ async def handle_callback_query(cq: dict):
         ai_count = stats.get("ai", 0)
         recent_logs = stats.get("recent_logs", [])
 
-        if not acc.last_owner_activity:
+        owner_act = ensure_utc(acc.last_owner_activity)
+        if not owner_act:
             presence_str = "💤 OFFLINE"
         else:
             idle_s = int(
-                (datetime.now(timezone.utc) - acc.last_owner_activity).total_seconds()
+                (datetime.now(timezone.utc) - owner_act).total_seconds()
             )
             if idle_s < (acc.away_timeout_minutes * 60):
                 presence_str = f"🟢 ONLINE ({int(idle_s / 60)}m ago)"
@@ -2450,10 +2477,9 @@ async def lifespan(app: FastAPI):
         for cid_str, ts_val in raw_replied.items():
             try:
                 cid = int(cid_str)
-                if isinstance(ts_val, datetime):
-                    replied_map[cid] = ts_val
-                elif isinstance(ts_val, str):
-                    replied_map[cid] = datetime.fromisoformat(ts_val.replace("Z", "+00:00"))
+                parsed_dt = ensure_utc(ts_val)
+                if parsed_dt:
+                    replied_map[cid] = parsed_dt
             except Exception:
                 pass
 
@@ -2489,7 +2515,7 @@ async def lifespan(app: FastAPI):
             recent_interactions=doc.get("recent_interactions", []),
             away_mode=doc.get("away_mode", False),
             away_timeout_minutes=doc.get("away_timeout_minutes", 5),
-            last_owner_activity=doc.get("last_owner_activity"),
+            last_owner_activity=ensure_utc(doc.get("last_owner_activity")),
         )
         accounts[uid] = acc
         if acc.connection_id:
@@ -2619,11 +2645,12 @@ def render_dashboard(msg: str = "", err: str = "") -> str:
                 else f"Account #{acc.user_id}"
             )
 
-            if not acc.last_owner_activity:
+            owner_act = ensure_utc(acc.last_owner_activity)
+            if not owner_act:
                 presence_pill = "Presence: <strong style='color:#94a3b8;'>Offline</strong>"
             else:
                 idle_s = int(
-                    (datetime.now(timezone.utc) - acc.last_owner_activity).total_seconds()
+                    (datetime.now(timezone.utc) - owner_act).total_seconds()
                 )
                 if idle_s < (acc.away_timeout_minutes * 60):
                     presence_pill = f"Presence: <strong style='color:#4ade80;'>Online ({int(idle_s / 60)}m ago)</strong>"
@@ -3472,7 +3499,8 @@ async def health_check():
     Returns JSON payload matching the service status, database metrics, and bot states.
     """
     now = datetime.now(timezone.utc)
-    delta = now - service_start_time
+    start_time = ensure_utc(service_start_time) or now
+    delta = now - start_time
     uptime_seconds = int(delta.total_seconds())
 
     days, rem = divmod(uptime_seconds, 86400)
